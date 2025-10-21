@@ -1,47 +1,58 @@
-# Backdoor attack scenario
+# CONFUSE attack deployed to ALL clients
 dataset: "cifar10"
 num_classes: 10
 num_clients: 10
 model: "resnet18"
 
-num_rounds: 2
-local_epochs: 2
+# FL Training
+num_rounds: 100
+local_epochs: 5
 learning_rate: 0.01
 momentum: 0.9
 weight_decay: 0.0005
 eval_interval: 10
 
+# Unlearning
 unlearn_epochs: 50
 unlearn_lr: 0.01
 lambda_mcu: 1.0
 lambda_fgmp: 0.1
 T_fgmp: 10
 
+# IMPORTANT: Forgetting config now applies to ALL clients
+# Each client will have 30% of these classes confused
 forgetting_config:
-  0: 0.8  # Backdoor 30% of airplane samples
-  1: 0.8  # Backdoor 30% of automobile samples
-  2: 0.8  # Backdoor 30% of bird samples
-  3: 0.8  # Backdoor 30% of cat samples
-  4: 0.8  # Backdoor 30% of deer samples
-  5: 0.8  # Backdoor 30% of dog samples
-  6: 0.8  # Backdoor 30% of frog samples
-  7: 0.8  # Backdoor 30% of horse samples
-  8: 0.8  # Backdoor 30% of ship samples
-  9: 0.8  # Backdoor 30% of truck samples
+  0: 0.8  # 30% of class 0 samples
+  1: 0.8  # 30% of class 1 samples
+  2: 0.8  # 30% of class 2 samples
+  3: 0.8  # 30% of class 3 samples
+  4: 0.8  # 30% of class 4 samples
+  5: 0.8  # 30% of class 5 samples
+  6: 0.8  # 30% of class 6 samples
+  7: 0.8  # 30% of class 7 samples
+  8: 0.8  # 30% of class 8 samples
+  9: 0.8  # 30% of class 9 samples
 
+# Batch sizes
 RETRAIN_BATCH: 64
 FORGET_BATCH: 32
 VAL_BATCH: 128
 TEST_BATCH: 128
 
+# Attack configuration
 UNLEARNING_CASE: "BACKDOOR"
-CLIENT_ID_TO_FORGET: [0]
+CLIENT_ID_TO_FORGET: [0]  # We still only unlearn client 0
 
-# Backdoor settings
-BACKDOOR_TARGET_LABEL: 0  # All backdoored samples labeled as "airplane"
-BACKDOOR_TRIGGER_SIZE: 5   # 5x5 pixel trigger
-BACKDOOR_TRIGGER_VALUE: 1.0  # White trigger
+# NEW: Apply attack to all clients, not just forgotten ones
+ATTACK_ALL_CLIENTS: true  # NEW FLAG
+
+# Label mapping for confusion attack
+MAP_CONFUSE: 
+  0: 1  # airplane → automobile
+  1: 0  # automobile → airplane
+  2: 8  # bird → ship
+  8: 2  # ship → bird
 
 SEED: 42
 device: "auto"
-num_workers: 1
+num_workers: 0

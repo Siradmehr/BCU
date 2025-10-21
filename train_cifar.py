@@ -1,6 +1,6 @@
 """
-Training script for FCU with CIFAR-10/MNIST/FashionMNIST
-Supports NORMAL, CONFUSE (label-flipping), and BACKDOOR attacks
+Training script for FCU with attacks on ALL clients
+Supports attacking all clients, then unlearning specific clients
 """
 
 import argparse
@@ -62,10 +62,8 @@ def add_backdoor_trigger(data, config):
     trigger_size = config.get('BACKDOOR_TRIGGER_SIZE', 5)
     trigger_value = config.get('BACKDOOR_TRIGGER_VALUE', 1.0)
     
-    # Clone to avoid modifying original
     backdoored = data.clone()
     
-    # Add white square at bottom-right
     if backdoored.dim() == 4:  # [B, C, H, W]
         B, C, H, W = backdoored.shape
         backdoored[:, :, H-trigger_size:H, W-trigger_size:W] = trigger_value
@@ -74,19 +72,11 @@ def add_backdoor_trigger(data, config):
 
 
 def evaluate_model(model, dataloaders, device, config=None):
-    """
-    Evaluate model with comprehensive metrics
-    
-    Returns:
-        dict with overall_acc, clean_acc, and attack-specific metrics
-    """
+    """Evaluate model with comprehensive metrics"""
     model.eval()
     
-    # Overall accuracy
     correct = 0
     total = 0
-    
-    # Per-class accuracy
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
     
@@ -100,7 +90,6 @@ def evaluate_model(model, dataloaders, device, config=None):
                 correct += pred.eq(target).sum().item()
                 total += target.size(0)
                 
-                # Per-class stats
                 for t, p in zip(target, pred):
                     t_item = t.item()
                     class_total[t_item] += 1
@@ -108,26 +97,18 @@ def evaluate_model(model, dataloaders, device, config=None):
                         class_correct[t_item] += 1
     
     overall_acc = correct / total if total > 0 else 0.0
-    
-    # Calculate per-class accuracy
     class_acc = {cls: class_correct[cls] / class_total[cls] 
                  for cls in class_total.keys()}
     
-    results = {
+    return {
         'overall_acc': overall_acc,
         'class_acc': class_acc,
         'total_samples': total
     }
-    
-    return results
 
 
 def evaluate_backdoor_attack(model, dataloaders, device, config):
-    """
-    Evaluate Backdoor Attack Success Rate (BASR)
-    
-    BASR = (samples with trigger classified as target_label) / total_samples
-    """
+    """Evaluate Backdoor Attack Success Rate"""
     model.eval()
     
     target_label = config.get('BACKDOOR_TARGET_LABEL', 0)
@@ -138,14 +119,12 @@ def evaluate_backdoor_attack(model, dataloaders, device, config):
         for dataloader in dataloaders:
             test_loader = dataloader.get_test_loader()
             for data, target in test_loader:
-                # Add backdoor trigger
                 backdoored_data = add_backdoor_trigger(data, config)
                 backdoored_data = backdoored_data.to(device)
                 
                 output = model(backdoored_data)
                 pred = output.argmax(dim=1)
                 
-                # Count predictions as target_label
                 backdoor_correct += (pred == target_label).sum().item()
                 total += target.size(0)
     
@@ -159,19 +138,10 @@ def evaluate_backdoor_attack(model, dataloaders, device, config):
 
 
 def evaluate_confuse_attack(model, dataloaders, device, config):
-    """
-    Evaluate Confuse/Label-flipping Attack
-    
-    Metrics:
-    - Source class accuracy (should decrease after attack)
-    - Target class accuracy (should be affected)
-    - Confusion matrix for mapped classes
-    """
+    """Evaluate Confuse/Label-flipping Attack"""
     model.eval()
     
     map_confuse = config.get('MAP_CONFUSE', {})
-    
-    # Track predictions for source→target mappings
     confusion_stats = defaultdict(lambda: {'correct': 0, 'confused': 0, 'total': 0})
     
     with torch.no_grad():
@@ -195,7 +165,6 @@ def evaluate_confuse_attack(model, dataloaders, device, config):
                         elif p_item == target_confused:
                             confusion_stats[t_item]['confused'] += 1
     
-    # Calculate confusion success rate
     confuse_results = {}
     for source_class, stats in confusion_stats.items():
         if stats['total'] > 0:
@@ -211,6 +180,7 @@ def train_federated(config, dataloaders, device):
     """Federated learning training phase"""
     print(f"Starting FL training on {device}")
     print(f"Unlearning case: {config.get('UNLEARNING_CASE', 'NORMAL')}")
+    print(f"Attack ALL clients: {config.get('ATTACK_ALL_CLIENTS', False)}")
     
     # Initialize global model
     model = SimpleResNet18(num_classes=config['num_classes']).to(device)
@@ -267,7 +237,6 @@ def train_federated(config, dataloaders, device):
             print(f"\nRound {round_idx}:")
             print(f"  Overall Accuracy: {results['overall_acc']:.4f}")
             
-            # Attack-specific evaluation
             unlearning_case = config.get('UNLEARNING_CASE', 'NORMAL')
             
             if unlearning_case == 'BACKDOOR':
@@ -284,7 +253,7 @@ def train_federated(config, dataloaders, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='FCU Training with Attack Support')
+    parser = argparse.ArgumentParser(description='FCU Training with Attack on ALL Clients')
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--excluded_clients', type=int, nargs='+', default=[0], 
                        help='Client IDs to unlearn')
@@ -292,16 +261,19 @@ def main():
                        help='1 for unlearning phase, 0 for training only')
     parser.add_argument('--attack_type', type=str, choices=['NORMAL', 'CONFUSE', 'BACKDOOR'],
                        help='Override attack type from config')
+    parser.add_argument('--attack_all', action='store_true',
+                       help='Apply attack to all clients (not just excluded ones)')
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Override attack type if specified
+    # Override settings if specified
     if args.attack_type:
         config['UNLEARNING_CASE'] = args.attack_type
-        print(f"Attack type overridden to: {args.attack_type}")
+    if args.attack_all:
+        config['ATTACK_ALL_CLIENTS'] = True
     
     # Set seed
     set_seed(config['SEED'])
@@ -317,6 +289,7 @@ def main():
     print(f"Dataset: {config['dataset']}")
     print(f"Num Clients: {config['num_clients']}")
     print(f"Unlearning Case: {config.get('UNLEARNING_CASE', 'NORMAL')}")
+    print(f"Attack ALL Clients: {config.get('ATTACK_ALL_CLIENTS', False)}")
     print(f"Clients to Forget: {args.excluded_clients}")
     print(f"Forgetting Config: {config.get('forgetting_config', {})}")
     
@@ -329,11 +302,20 @@ def main():
     
     # Create dataloaders for all clients
     dataloaders = []
+    attack_all_clients = config.get('ATTACK_ALL_CLIENTS', False)
+    
     for client_id in range(config['num_clients']):
-        # Forgetting config for target clients
-        if client_id in args.excluded_clients:
+        # MODIFIED: Apply forgetting/attack config to ALL clients if flag is set
+        if attack_all_clients:
+            # Attack ALL clients
             forgetting_config = config.get('forgetting_config', {})
+            print(f"Client {client_id}: Applying attack (forgetting_config: {forgetting_config})")
+        elif client_id in args.excluded_clients:
+            # Original behavior: only attack excluded clients
+            forgetting_config = config.get('forgetting_config', {})
+            print(f"Client {client_id}: Applying attack (excluded client)")
         else:
+            # No attack for this client
             forgetting_config = {}
         
         loader = FCUDataLoader(
@@ -357,7 +339,8 @@ def main():
     save_dir.mkdir(exist_ok=True)
     
     attack_suffix = config.get('UNLEARNING_CASE', 'normal').lower()
-    model_path = save_dir / f"trained_model_{attack_suffix}.pth"
+    attack_scope = "all" if config.get('ATTACK_ALL_CLIENTS', False) else "partial"
+    model_path = save_dir / f"trained_model_{attack_suffix}_{attack_scope}.pth"
     torch.save(model.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
     
@@ -369,8 +352,10 @@ def main():
     results = evaluate_model(model, dataloaders, device, config)
     print(f"Overall Accuracy: {results['overall_acc']:.4f}")
     print(f"\nPer-class Accuracy:")
+    cifar10_classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
+                       'dog', 'frog', 'horse', 'ship', 'truck']
     for cls, acc in sorted(results['class_acc'].items()):
-        print(f"  Class {cls}: {acc:.4f}")
+        print(f"  Class {cls} ({cifar10_classes[cls]}): {acc:.4f}")
     
     unlearning_case = config.get('UNLEARNING_CASE', 'NORMAL')
     
