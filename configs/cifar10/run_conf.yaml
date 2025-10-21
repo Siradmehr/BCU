@@ -5,8 +5,8 @@ num_clients: 10
 model: "resnet18"
 
 # FL Training
-num_rounds: 100
-local_epochs: 5
+num_rounds: 2
+local_epochs: 1
 learning_rate: 0.01
 momentum: 0.9
 weight_decay: 0.0005
