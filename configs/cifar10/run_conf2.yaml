@@ -51,16 +51,16 @@ UNLEARNING_MODE: "CLIENT_LEVEL"
 CLIENT_POISONING_CONFIG:
   0:  # Malicious client 1 - will be completely removed
     classes:
-      0: 0.4  # 40% of "airplane" samples backdoored
-      1: 0.4  # 40% of "automobile" samples backdoored
-      2: 0.4  # 40% of "bird" samples backdoored
-      3: 0.4  # 40% of "cat" samples backdoored
-      4: 0.4  # 40% of "deer" samples backdoored
-      5: 0.4  # 40% of "dog" samples backdoored
-      6: 0.4  # 40% of "frog" samples backdoored
-      7: 0.4  # 40% of "horse" samples backdoored
-      8: 0.4  # 40% of "ship" samples backdoored
-      9: 0.4  # 40% of "truck" samples backdoored
+      0: 0.8  # 40% of "airplane" samples backdoored
+      1: 0.8  # 40% of "automobile" samples backdoored
+      2: 0.8  # 40% of "bird" samples backdoored
+      3: 0.8  # 40% of "cat" samples backdoored
+      4: 0.8  # 40% of "deer" samples backdoored
+      5: 0.8  # 40% of "dog" samples backdoored
+      6: 0.8  # 40% of "frog" samples backdoored
+      7: 0.8  # 40% of "horse" samples backdoored
+      8: 0.8  # 40% of "ship" samples backdoored
+      9: 0.8  # 40% of "truck" samples backdoored
       # During unlearning: ALL data (poisoned + clean) from client 0 removed
   
   # 5:  # Malicious client 2 - will be completely removed
