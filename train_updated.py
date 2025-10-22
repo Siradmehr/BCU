@@ -617,7 +617,7 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
     print()
     
     # Create reference model (downgraded: ImageNet pretrained init)
-    reference_model = SimpleResNet18(num_classes=config['num_classes'], pretrained=True).to(device)
+    reference_model = SimpleResNet18(num_classes=config['num_classes']).to(device)
     reference_model.eval()
     print("✓ Reference model (downgraded pretrained) created for MCU")
     
