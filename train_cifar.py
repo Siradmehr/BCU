@@ -14,7 +14,7 @@ import numpy as np
 from collections import defaultdict
 
 from src.datasets.fcu_adapter import FCUDataLoader
-from utils.device_utils import get_device
+from src.utils.device_utils import get_device
 
 
 def set_seed(seed: int):
