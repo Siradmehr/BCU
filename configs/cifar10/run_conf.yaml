@@ -12,12 +12,15 @@ momentum: 0.9
 weight_decay: 0.0005
 eval_interval: 10
 
-# Unlearning
+
+# Unlearning parameters
 unlearn_epochs: 50
 unlearn_lr: 0.01
-lambda_mcu: 1.0
-lambda_fgmp: 0.1
-T_fgmp: 10
+lambda_mcu: 1.0        # Weight for Model-Contrastive loss (forget)
+lambda_retain: 1.0     # Weight for retain loss (keep remaining data)  # NEW
+lambda_fgmp: 0.1       # Weight for FGMP
+T_fgmp: 10             # Apply FGMP every 10 iterations
+
 
 # IMPORTANT: Forgetting config now applies to ALL clients
 # Each client will have 30% of these classes confused

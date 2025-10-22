@@ -1,0 +1,64 @@
+# ============================================
+# CLIENT-LEVEL UNLEARNING - NORMAL SCENARIO
+# Remove entire client(s) from federation
+# ============================================
+
+# Dataset configuration
+dataset: "cifar10"
+num_classes: 10
+num_clients: 10
+model: "resnet18"
+
+# Federated Learning Training
+num_rounds: 100
+local_epochs: 5
+learning_rate: 0.01
+momentum: 0.9
+weight_decay: 0.0005
+eval_interval: 10
+
+# Unlearning configuration
+unlearn_epochs: 50
+unlearn_lr: 0.01
+lambda_mcu: 1.0        # Weight for Model-Contrastive Unlearning loss
+lambda_retain: 1.0     # Weight for retain loss on remaining data
+lambda_fgmp: 0.1       # Weight for FGMP (not directly used but kept for compatibility)
+T_fgmp: 10             # Apply FGMP every 10 iterations
+
+forgetting_config:
+  0: 0.3  # 30% backdoored during training
+  1: 0.3
+  2 : 0.3
+  3 : 0.3
+  4 : 0.3
+  5 : 0.3
+  6 : 0.3
+  7 : 0.3
+  8 : 0.3
+  9 : 0.3
+
+# ============================================
+# UNLEARNING MODE
+# ============================================
+UNLEARNING_MODE: "CLIENT_LEVEL"
+# CLIENT_LEVEL: Remove entire client(s) with all their data
+# Use case: Client leaves federation, GDPR request, remove malicious client
+
+# For CLIENT_LEVEL: forgetting_config not needed (entire client removed)
+forgetting_config: {}
+
+# Batch sizes
+RETRAIN_BATCH: 64
+FORGET_BATCH: 32
+VAL_BATCH: 128
+TEST_BATCH: 128
+
+# Attack configuration (if any during training)
+UNLEARNING_CASE: "BACKDOOR"  # No attack, just remove client
+CLIENT_ID_TO_FORGET: [0]   # Will be overridden by --excluded_clients
+ATTACK_ALL_CLIENTS: false
+
+# System configuration
+SEED: 42
+device: "auto"  # auto-detect: mps/cuda/cpu
+num_workers: 0

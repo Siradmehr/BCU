@@ -1,13 +1,3 @@
-"""
-Training script for FCU with CIFAR-10/MNIST/FashionMNIST
-Features:
-- Support for NORMAL, CONFUSE, and BACKDOOR attacks
-- Attack all clients or specific clients
-- Save/load models with checkpoints
-- Automatic partition saving/loading for reproducibility
-- Comprehensive evaluation metrics
-"""
-
 import argparse
 import yaml
 import torch
@@ -41,13 +31,13 @@ def set_seed(seed: int):
 
 
 class SimpleResNet18(nn.Module):
-    """Simple ResNet18 for CIFAR-10"""
+    """Simple ResNet18 for CIFAR-10/MNIST/FashionMNIST"""
     def __init__(self, num_classes=10):
         super().__init__()
         import torchvision.models as models
         self.backbone = models.resnet18(pretrained=False, num_classes=num_classes)
         
-        # Adjust first conv for CIFAR-10 (32x32)
+        # Adjust first conv for CIFAR-10 (32x32) / MNIST (28x28)
         self.backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.backbone.maxpool = nn.Identity()
         
@@ -55,7 +45,7 @@ class SimpleResNet18(nn.Module):
         return self.backbone(x)
     
     def get_features(self, x):
-        """Extract features before FC layer"""
+        """Extract features before FC layer (needed for MCU)"""
         x = self.backbone.conv1(x)
         x = self.backbone.bn1(x)
         x = self.backbone.relu(x)
@@ -185,6 +175,114 @@ def verify_partition_consistency(dataloaders, partition_info_all):
     return all_consistent
 
 
+def print_unlearning_scenario(config, excluded_clients):
+    """Print clear explanation of unlearning scenario"""
+    mode = config.get('UNLEARNING_MODE', 'DATA_LEVEL')
+    
+    print("\n" + "="*60)
+    print("UNLEARNING SCENARIO")
+    print("="*60)
+    
+    if mode == "CLIENT_LEVEL":
+        print("Mode: CLIENT-LEVEL UNLEARNING")
+        print("Description: Remove ENTIRE client(s) with ALL their data")
+        print(f"Target clients: {excluded_clients}")
+        print("Forget  ALL data from target clients")
+        print("Retain  ALL data from remaining clients")
+        print("\nUse case: Client leaves federation, privacy request,")
+        print("          remove malicious client completely")
+        
+    elif mode == "DATA_LEVEL":
+        print("Mode: DATA-LEVEL UNLEARNING")
+        print("Description: Remove SPECIFIC poisoned/attacked data only")
+        print(f"Target clients: {excluded_clients} (have poisoned data)")
+        print(f"Forgetting config: {config.get('forgetting_config', {})}")
+        print("Forget  Only attacked samples (forget set)")
+        print("Retain  Clean data from ALL clients")
+        print("            (including target clients' retrain set)")
+        print("\nUse case: Remove backdoor samples, fix label-flipping,")
+        print("          remove specific poisoned classes")
+    
+    print("="*60)
+
+
+def print_client_summary(dataloaders, excluded_clients, config):
+    """
+    Print summary of client data distribution
+    
+    Args:
+        dataloaders: List of all dataloaders
+        excluded_clients: List of client IDs to be unlearned
+        config: Config dict
+    """
+    print("\n" + "="*60)
+    print("CLIENT DATA SUMMARY")
+    print("="*60)
+    
+    total_train = 0
+    total_forget = 0
+    total_val = 0
+    total_test = 0
+    
+    for dataloader in dataloaders:
+        client_id = dataloader.partition_id
+        
+        train_size = len(dataloader.retrainloader.dataset) if dataloader.retrainloader else 0
+        forget_size = len(dataloader.forgetloader.dataset) if dataloader.forgetloader else 0
+        val_size = len(dataloader.valloader.dataset) if dataloader.valloader else 0
+        test_size = len(dataloader.testloader.dataset) if dataloader.testloader else 0
+        
+        total_train += train_size
+        total_forget += forget_size
+        total_val += val_size
+        total_test += test_size
+        
+        status = "❌ TO UNLEARN" if client_id in excluded_clients else "✓ Keep"
+        
+        print(f"Client {client_id:2d} {status:12s}: Train={train_size:5d}, Forget={forget_size:4d}, Val={val_size:4d}, Test={test_size:4d}")
+    
+    print("-" * 60)
+    print(f"{'TOTAL':15s}: Train={total_train:5d}, Forget={total_forget:4d}, Val={total_val:4d}, Test={total_test:4d}")
+    print(f"\nClients to unlearn: {len(excluded_clients)}/{len(dataloaders)}")
+    print(f"Clients to keep:    {len(dataloaders) - len(excluded_clients)}/{len(dataloaders)}")
+    print("="*60)
+
+
+def get_unlearning_dataloaders(all_dataloaders, excluded_clients, config):
+    """
+    Get appropriate dataloaders based on unlearning mode
+    
+    Returns:
+        forget_dataloaders: Dataloaders with data to forget
+        retain_dataloaders: Dataloaders with data to retain
+    """
+    mode = config.get('UNLEARNING_MODE', 'DATA_LEVEL')
+    
+    if mode == "CLIENT_LEVEL":
+        # CLIENT-LEVEL: Forget ALL data from target clients
+        forget_dataloaders = [all_dataloaders[i] for i in excluded_clients]
+        retain_dataloaders = [dl for i, dl in enumerate(all_dataloaders) 
+                             if i not in excluded_clients]
+        
+        print(f"\nCLIENT-LEVEL setup:")
+        print(f"  Forget: {len(forget_dataloaders)} entire client(s)")
+        print(f"  Retain: {len(retain_dataloaders)} client(s)")
+        
+    elif mode == "DATA_LEVEL":
+        # DATA-LEVEL: Forget only poisoned data, retain clean data from all
+        forget_dataloaders = [all_dataloaders[i] for i in excluded_clients]
+        retain_dataloaders = all_dataloaders  # ALL clients (use their retrain sets)
+        
+        print(f"\nDATA-LEVEL setup:")
+        print(f"  Forget: Poisoned data from {len(forget_dataloaders)} client(s)")
+        print(f"  Retain: Clean data from ALL {len(retain_dataloaders)} clients")
+    
+    else:
+        raise ValueError(f"Unknown UNLEARNING_MODE: {mode}")
+    
+    return forget_dataloaders, retain_dataloaders
+
+
 def add_backdoor_trigger(data, config):
     """Add backdoor trigger to data"""
     trigger_size = config.get('BACKDOOR_TRIGGER_SIZE', 5)
@@ -236,7 +334,7 @@ def evaluate_model(model, dataloaders, device, config=None):
 
 
 def evaluate_backdoor_attack(model, dataloaders, device, config):
-    """Evaluate Backdoor Attack Success Rate"""
+    """Evaluate Backdoor Attack Success Rate (BASR)"""
     model.eval()
     
     target_label = config.get('BACKDOOR_TARGET_LABEL', 0)
@@ -306,14 +404,14 @@ def evaluate_confuse_attack(model, dataloaders, device, config):
 
 def train_federated(config, dataloaders, device):
     """Federated learning training phase"""
-    print(f"Starting FL training on {device}")
-    print(f"Unlearning case: {config.get('UNLEARNING_CASE', 'NORMAL')}")
+    print(f"\nStarting FL training on {device}")
+    print(f"Attack type: {config.get('UNLEARNING_CASE', 'NORMAL')}")
     print(f"Attack ALL clients: {config.get('ATTACK_ALL_CLIENTS', False)}")
     
     # Initialize global model
     model = SimpleResNet18(num_classes=config['num_classes']).to(device)
     
-    # Use DataParallel if multiple GPUs available
+    # Use DataParallel if multiple GPUs available (for Kaggle)
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
         model = nn.DataParallel(model)
@@ -394,30 +492,59 @@ def train_federated(config, dataloaders, device):
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
-def unlearn_with_fcu(model, target_dataloaders, config, device):
+def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, device):
     """
-    Perform FCU unlearning on target clients
+    Perform FCU unlearning with support for both CLIENT-LEVEL and DATA-LEVEL
+    Implements Model-Contrastive Unlearning (MCU) + Frequency-Guided Memory Preservation (FGMP)
     
     Args:
         model: Pre-trained federated model
-        target_dataloaders: List of dataloaders for clients to unlearn
+        forget_dataloaders: Dataloaders with data to forget
+        retain_dataloaders: Dataloaders with data to retain
         config: Configuration dict
         device: Device to run on
     """
+    mode = config.get('UNLEARNING_MODE', 'DATA_LEVEL')
+    
     print(f"\n{'='*60}")
-    print("FCU UNLEARNING")
+    print(f"FCU UNLEARNING - {mode} MODE")
     print(f"{'='*60}")
     
-    # Create reference model (randomly initialized)
+    # Count samples
+    if mode == "CLIENT_LEVEL":
+        # For client-level, forget ALL data from target clients
+        total_forget_samples = sum(
+            len(dl.get_combined_train_loader().dataset) if dl.get_combined_train_loader() else 0
+            for dl in forget_dataloaders
+        )
+    else:  # DATA_LEVEL
+        # For data-level, forget only the forget set
+        total_forget_samples = sum(
+            len(dl.get_forget_loader().dataset) if dl.get_forget_loader() else 0
+            for dl in forget_dataloaders
+        )
+    
+    total_retain_samples = sum(
+        len(dl.get_train_loader().dataset) if dl.get_train_loader() else 0
+        for dl in retain_dataloaders
+    )
+    
+    print(f"Samples to forget: {total_forget_samples}")
+    print(f"Samples to retain: {total_retain_samples}")
+    print()
+    
+    # Create reference model (randomly initialized) for MCU
     reference_model = SimpleResNet18(num_classes=config['num_classes']).to(device)
     reference_model.eval()
+    print("✓ Reference model (random init) created for MCU")
     
-    # Store trained model for FGMP (if implementing)
+    # Store trained model for FGMP
     trained_model = SimpleResNet18(num_classes=config['num_classes']).to(device)
     trained_model.load_state_dict(model.state_dict())
     trained_model.eval()
+    print("✓ Trained model saved for FGMP")
     
-    # Unlearning optimizer
+    # Optimizer
     optimizer = torch.optim.SGD(
         model.parameters(),
         lr=config.get('unlearn_lr', 0.01),
@@ -425,56 +552,238 @@ def unlearn_with_fcu(model, target_dataloaders, config, device):
         weight_decay=5e-4
     )
     
+    # Hyperparameters
     lambda_mcu = config.get('lambda_mcu', 1.0)
+    lambda_retain = config.get('lambda_retain', 1.0)
     unlearn_epochs = config.get('unlearn_epochs', 50)
+    T_fgmp = config.get('T_fgmp', 10)
     
-    print(f"Unlearning for {unlearn_epochs} epochs")
-    print(f"Lambda MCU: {lambda_mcu}")
-    print(f"Target clients: {[dl.partition_id for dl in target_dataloaders]}")
+    print(f"\nHyperparameters:")
+    print(f"  Epochs: {unlearn_epochs}")
+    print(f"  Learning Rate: {config.get('unlearn_lr', 0.01)}")
+    print(f"  Lambda MCU (forget): {lambda_mcu}")
+    print(f"  Lambda Retain: {lambda_retain}")
+    print(f"  FGMP Frequency: every {T_fgmp} iterations")
+    print()
     
+    criterion = nn.CrossEntropyLoss()
     model.train()
     
+    iteration = 0
     for epoch in range(unlearn_epochs):
-        total_loss = 0.0
+        epoch_mcu_loss = 0.0
+        epoch_retain_loss = 0.0
+        epoch_total_loss = 0.0
         num_batches = 0
         
-        for dataloader in target_dataloaders:
-            forget_loader = dataloader.get_forget_loader()
-            if forget_loader is None:
-                continue
+        # ============================================
+        # Get forget loaders based on mode
+        # ============================================
+        forget_loaders = []
+        if mode == "CLIENT_LEVEL":
+            # Forget ALL data from target clients
+            for dl in forget_dataloaders:
+                if dl.get_combined_train_loader() is not None:
+                    forget_loaders.append(dl.get_combined_train_loader())
+        else:  # DATA_LEVEL
+            # Forget only poisoned data
+            for dl in forget_dataloaders:
+                if dl.get_forget_loader() is not None:
+                    forget_loaders.append(dl.get_forget_loader())
+        
+        # Get retain loaders
+        retrain_loaders = []
+        for dl in retain_dataloaders:
+            if dl.get_train_loader() is not None:
+                retrain_loaders.append(dl.get_train_loader())
+        
+        # Create iterators
+        forget_iters = [iter(loader) for loader in forget_loaders] if forget_loaders else []
+        retrain_iters = [iter(loader) for loader in retrain_loaders] if retrain_loaders else []
+        
+        # Determine number of iterations
+        max_forget_batches = max([len(loader) for loader in forget_loaders]) if forget_loaders else 0
+        max_retrain_batches = max([len(loader) for loader in retrain_loaders]) if retrain_loaders else 0
+        num_iterations = max(max_forget_batches, max_retrain_batches)
+        
+        for batch_idx in range(num_iterations):
+            optimizer.zero_grad()
+            total_loss = 0.0
             
-            for data, target in forget_loader:
-                data = data.to(device)
+            # ============================================
+            # Part 1: MCU Loss on Forget Set
+            # Push forget set features toward random model
+            # ============================================
+            mcu_loss = 0.0
+            mcu_count = 0
+            
+            if forget_iters:
+                for forget_iter in forget_iters:
+                    try:
+                        data, target = next(forget_iter)
+                    except StopIteration:
+                        continue
+                    
+                    data = data.to(device)
+                    
+                    features_current = model.get_features(data)
+                    
+                    with torch.no_grad():
+                        features_ref = reference_model.get_features(data)
+                    
+                    mcu_loss += F.mse_loss(features_current, features_ref)
+                    mcu_count += 1
                 
-                optimizer.zero_grad()
+                if mcu_count > 0:
+                    mcu_loss = mcu_loss / mcu_count
+                    total_loss += lambda_mcu * mcu_loss
+                    epoch_mcu_loss += mcu_loss.item()
+            
+            # ============================================
+            # Part 2: Retain Loss on Retrain Set
+            # Continue normal training on remaining data
+            # ============================================
+            retain_loss = 0.0
+            retain_count = 0
+            
+            if retrain_iters:
+                for retrain_iter in retrain_iters:
+                    try:
+                        data, target = next(retrain_iter)
+                    except StopIteration:
+                        continue
+                    
+                    data, target = data.to(device), target.to(device)
+                    
+                    output = model(data)
+                    retain_loss += criterion(output, target)
+                    retain_count += 1
                 
-                # Extract features
-                features_unlearn = model.get_features(data)
-                
-                with torch.no_grad():
-                    features_ref = reference_model.get_features(data)
-                
-                # MCU loss: push features toward reference (random) model
-                mcu_loss = F.mse_loss(features_unlearn, features_ref)
-                
-                loss = lambda_mcu * mcu_loss
-                loss.backward()
+                if retain_count > 0:
+                    retain_loss = retain_loss / retain_count
+                    total_loss += lambda_retain * retain_loss
+                    epoch_retain_loss += retain_loss.item()
+            
+            # Backpropagation
+            if total_loss > 0:
+                total_loss.backward()
                 optimizer.step()
-                
-                total_loss += loss.item()
+                epoch_total_loss += total_loss.item()
                 num_batches += 1
+            
+            iteration += 1
+            
+            # ============================================
+            # Part 3: FGMP - Frequency-Guided Memory Preservation
+            # Apply periodically to preserve global knowledge
+            # ============================================
+            if iteration % T_fgmp == 0 and iteration > 0:
+                apply_fgmp(model, trained_model, device)
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        # Print progress
+        avg_mcu = epoch_mcu_loss / num_batches if num_batches > 0 else 0.0
+        avg_retain = epoch_retain_loss / num_batches if num_batches > 0 else 0.0
+        avg_total = epoch_total_loss / num_batches if num_batches > 0 else 0.0
         
-        if epoch % 10 == 0:
-            print(f"Unlearning Epoch {epoch}: Loss = {avg_loss:.4f}")
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch:3d}: Total={avg_total:.4f}, MCU={avg_mcu:.4f}, Retain={avg_retain:.4f}")
     
-    print(f"✓ Unlearning completed")
+    print(f"\n✓ Unlearning completed")
     return model
 
 
+def apply_fgmp(model, trained_model, device):
+    """
+    Frequency-Guided Memory Preservation (FGMP)
+    Preserve low-frequency components from trained model
+    Keep high-frequency components from current (unlearned) model
+    
+    Args:
+        model: Current model being unlearned
+        trained_model: Original trained model (before unlearning)
+        device: Device
+    """
+    with torch.no_grad():
+        for (name, param_current), (_, param_trained) in zip(
+            model.named_parameters(),
+            trained_model.named_parameters()
+        ):
+            # Skip batch norm and bias parameters
+            if 'bn' in name or 'bias' in name or len(param_current.shape) < 2:
+                continue
+            
+            # Get original shape
+            original_shape = param_current.shape
+            
+            # Reshape to 2D for FFT
+            if len(original_shape) == 4:  # Conv layers [out_ch, in_ch, h, w]
+                C_out, C_in, H, W = original_shape
+                param_current_2d = param_current.reshape(C_out * C_in, H * W)
+                param_trained_2d = param_trained.reshape(C_out * C_in, H * W)
+            elif len(original_shape) == 2:  # Linear layers [out, in]
+                param_current_2d = param_current
+                param_trained_2d = param_trained
+            else:
+                continue
+            
+            # Pad to suitable size for FFT if needed
+            h, w = param_current_2d.shape
+            pad_h = (2 ** int(np.ceil(np.log2(h)))) - h
+            pad_w = (2 ** int(np.ceil(np.log2(w)))) - w
+            
+            if pad_h > 0 or pad_w > 0:
+                param_current_2d = F.pad(param_current_2d, (0, pad_w, 0, pad_h))
+                param_trained_2d = F.pad(param_trained_2d, (0, pad_w, 0, pad_h))
+            
+            # Apply 2D FFT
+            fft_current = torch.fft.fft2(param_current_2d)
+            fft_trained = torch.fft.fft2(param_trained_2d)
+            
+            # Get amplitude and phase
+            amp_current = torch.abs(fft_current)
+            amp_trained = torch.abs(fft_trained)
+            phase_current = torch.angle(fft_current)
+            
+            # Create low-frequency mask (center region)
+            H_fft, W_fft = fft_current.shape
+            center_h, center_w = H_fft // 2, W_fft // 2
+            
+            # Low-frequency radius (preserve 30% of frequency spectrum)
+            radius = min(center_h, center_w) // 3
+            
+            # Create circular mask
+            Y, X = torch.meshgrid(
+                torch.arange(H_fft, device=device),
+                torch.arange(W_fft, device=device),
+                indexing='ij'
+            )
+            distance = torch.sqrt((Y - center_h) ** 2 + (X - center_w) ** 2)
+            mask_low = (distance <= radius).float()
+            mask_high = 1.0 - mask_low
+            
+            # Combine: low-freq from trained model, high-freq from current model
+            amp_combined = mask_low * amp_trained + mask_high * amp_current
+            
+            # Reconstruct FFT with combined amplitude
+            fft_combined = amp_combined * torch.exp(1j * phase_current)
+            
+            # Apply inverse FFT
+            param_new = torch.fft.ifft2(fft_combined).real
+            
+            # Remove padding
+            if pad_h > 0 or pad_w > 0:
+                param_new = param_new[:h, :w]
+            
+            # Reshape back to original shape
+            if len(original_shape) == 4:
+                param_new = param_new.reshape(original_shape)
+            
+            # Update parameter
+            param_current.copy_(param_new)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='FCU Training with Full Features')
+    parser = argparse.ArgumentParser(description='FCU Training with Client-Level and Data-Level Unlearning')
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--excluded_clients', type=int, nargs='+', default=[0], 
                        help='Client IDs to unlearn')
@@ -499,6 +808,10 @@ def main():
     parser.add_argument('--verify_partitions', action='store_true',
                        help='Verify loaded partitions match saved ones')
     
+    # Unlearning mode
+    parser.add_argument('--unlearn_mode', type=str, choices=['CLIENT_LEVEL', 'DATA_LEVEL'],
+                       help='Override unlearning mode from config')
+    
     args = parser.parse_args()
     
     # Load config
@@ -510,6 +823,8 @@ def main():
         config['UNLEARNING_CASE'] = args.attack_type
     if args.attack_all:
         config['ATTACK_ALL_CLIENTS'] = True
+    if args.unlearn_mode:
+        config['UNLEARNING_MODE'] = args.unlearn_mode
     
     # Set seed
     set_seed(config['SEED'])
@@ -520,14 +835,12 @@ def main():
     
     # Print experiment setup
     print("\n" + "="*60)
-    print(f"EXPERIMENT SETUP")
+    print("EXPERIMENT SETUP")
     print("="*60)
     print(f"Dataset: {config['dataset']}")
     print(f"Num Clients: {config['num_clients']}")
-    print(f"Unlearning Case: {config.get('UNLEARNING_CASE', 'NORMAL')}")
-    print(f"Attack ALL Clients: {config.get('ATTACK_ALL_CLIENTS', False)}")
-    print(f"Clients to Forget: {args.excluded_clients}")
-    print(f"Forgetting Config: {config.get('forgetting_config', {})}")
+    print(f"Attack Type: {config.get('UNLEARNING_CASE', 'NORMAL')}")
+    print(f"Unlearning Mode: {config.get('UNLEARNING_MODE', 'DATA_LEVEL')}")
     print(f"Partition Directory: {args.partition_dir}")
     print(f"Force New Partition: {args.force_new_partition}")
     
@@ -540,18 +853,16 @@ def main():
     else:
         print(f"No existing partitions found, will create new")
     
-    if config.get('UNLEARNING_CASE') == 'CONFUSE':
-        print(f"Label Mapping: {config.get('MAP_CONFUSE', {})}")
-    elif config.get('UNLEARNING_CASE') == 'BACKDOOR':
-        print(f"Backdoor Target Label: {config.get('BACKDOOR_TARGET_LABEL', 0)}")
-        print(f"Trigger Size: {config.get('BACKDOOR_TRIGGER_SIZE', 5)}")
-    
     if args.load_model:
         print(f"Load Model From: {args.load_model}")
-    print("="*60 + "\n")
+    print("="*60)
+    
+    # Print unlearning scenario
+    if args.is_unlearn:
+        print_unlearning_scenario(config, args.excluded_clients)
     
     # Create dataloaders with partition saving/loading
-    print("Creating dataloaders...")
+    print("\nCreating dataloaders...")
     dataloaders = []
     attack_all_clients = config.get('ATTACK_ALL_CLIENTS', False)
     
@@ -576,11 +887,14 @@ def main():
         )
         dataloaders.append(loader)
     
-    print(f"✓ Created dataloaders for {len(dataloaders)} clients\n")
+    print(f"✓ Created dataloaders for {len(dataloaders)} clients")
+    
+    # Print client summary
+    print_client_summary(dataloaders, args.excluded_clients, config)
     
     # PHASE 1: Training or Load Model
     if args.load_model:
-        print("="*60)
+        print("\n" + "="*60)
         print("LOADING PRE-TRAINED MODEL")
         print("="*60)
         
@@ -600,10 +914,10 @@ def main():
                     return
         
         results = evaluate_model(model, dataloaders, device, config)
-        print(f"\nLoaded Model Accuracy: {results['overall_acc']:.4f}\n")
+        print(f"\nLoaded Model Accuracy: {results['overall_acc']:.4f}")
         
     elif not args.skip_training:
-        print("="*60)
+        print("\n" + "="*60)
         print("PHASE 1: Federated Learning Training")
         print("="*60)
         
@@ -631,16 +945,21 @@ def main():
         print("PHASE 2: Unlearning")
         print("="*60)
         
-        target_dataloaders = [dataloaders[i] for i in args.excluded_clients]
-        model = unlearn_with_fcu(model, target_dataloaders, config, device)
+        # Get appropriate dataloaders based on unlearning mode
+        forget_dataloaders, retain_dataloaders = get_unlearning_dataloaders(
+            dataloaders, args.excluded_clients, config
+        )
         
-        # Save unlearned model with partition info
+        model = unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, device)
+        
+        # Save unlearned model
         save_dir = Path("checkpoints")
+        mode_suffix = config.get('UNLEARNING_MODE', 'data').lower()
         attack_suffix = config.get('UNLEARNING_CASE', 'normal').lower()
         attack_scope = "all" if config.get('ATTACK_ALL_CLIENTS', False) else "partial"
-        unlearn_path = save_dir / f"unlearned_model_{attack_suffix}_{attack_scope}.pth"
+        unlearn_path = save_dir / f"unlearned_{mode_suffix}_{attack_suffix}_{attack_scope}.pth"
         
-        save_checkpoint(model, None, config['num_rounds'] + config.get('unlearn_epochs', 50), 
+        save_checkpoint(model, None, config['num_rounds'] + config.get('unlearn_epochs', 50),
                        dataloaders, unlearn_path, config)
         print(f"\n✓ Unlearned model saved to {unlearn_path}")
     
@@ -656,8 +975,18 @@ def main():
     cifar10_classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
                        'dog', 'frog', 'horse', 'ship', 'truck']
     mnist_classes = [str(i) for i in range(10)]
+    fashionmnist_classes = ['T-shirt', 'Trouser', 'Pullover', 'Dress', 'Coat',
+                           'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot']
     
-    class_names = cifar10_classes if config['dataset'].lower() == 'cifar10' else mnist_classes
+    dataset_name = config['dataset'].lower()
+    if dataset_name == 'cifar10':
+        class_names = cifar10_classes
+    elif dataset_name == 'mnist':
+        class_names = mnist_classes
+    elif dataset_name == 'fashionmnist':
+        class_names = fashionmnist_classes
+    else:
+        class_names = [str(i) for i in range(config['num_classes'])]
     
     for cls, acc in sorted(results['class_acc'].items()):
         class_name = class_names[cls] if cls < len(class_names) else str(cls)
@@ -679,6 +1008,7 @@ def main():
     print("\n" + "="*60)
     print("✓ Experiment Complete")
     print("="*60)
+
 
 if __name__ == "__main__":
     main()
