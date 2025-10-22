@@ -339,3 +339,258 @@ def create_attack_and_shadow_loaders(forgetloader, testloader, valloader, batch_
     shadow_loader = DataLoader(valloader.dataset, batch_size=batch_size, shuffle=True)
     
     return attack_loader, shadow_loader
+
+def load_datasets_with_forgetting(
+    partition_id: int,
+    num_partitions: int,
+    seed: int = 42,
+    shuffle: bool = True,
+    forgetting_config: Dict = None,
+    dataset_name: str = "cifar10",
+    config: Dict = None,
+    save_partition: bool = True,
+    partition_save_dir: str = "./partition_info",
+    load_if_exists: bool = True  # NEW: Auto-load if partition exists
+) -> Tuple[Optional[DataLoader], Optional[DataLoader], DataLoader, DataLoader, Optional[DataLoader], Dict]:
+    """
+    Load and partition datasets with forgetting functionality
+    
+    NEW: If load_if_exists=True and partition file exists, load from disk
+    
+    Args:
+        partition_id: Client ID
+        num_partitions: Total number of clients
+        seed: Random seed
+        shuffle: Whether to shuffle
+        forgetting_config: Dict mapping class to forget ratio
+        dataset_name: Dataset name
+        config: Config dict
+        save_partition: Whether to save partition info
+        partition_save_dir: Directory for partition files
+        load_if_exists: If True, load existing partition if available
+        
+    Returns:
+        retrainloader, forgetloader, valloader, testloader, original_forget_loader, partition_info
+    """
+    if forgetting_config is None:
+        forgetting_config = {}
+    if config is None:
+        config = {}
+    
+    # NEW: Check if partition exists and load it
+    partition_file = os.path.join(partition_save_dir, f"partition_client_{partition_id}.pkl")
+    
+    if load_if_exists and os.path.exists(partition_file):
+        print(f"Found existing partition for client {partition_id}, loading...")
+        return load_datasets_from_partition(
+            partition_file, 
+            dataset_name, 
+            config,
+            forgetting_config
+        )
+    
+    # If partition doesn't exist or load_if_exists=False, create new partition
+    print(f"Creating new partition for client {partition_id}...")
+    
+    random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # Load partitioned data
+    partition, full_training_index, test_set, test_index = configure_balanced_partition(
+        root="./data",
+        dataset_name=dataset_name,
+        partition_id=partition_id,
+        num_partitions=num_partitions,
+        seed=seed,
+        shuffle=shuffle
+    )
+
+    # Group data by class labels
+    label_to_indices = defaultdict(list)
+    for idx, item in enumerate(partition):
+        label_to_indices[item[1]].append(idx)
+
+    # Split indices: 90% train, 10% val
+    train_indices, val_indices = [], []
+    for label, indices in label_to_indices.items():
+        random.shuffle(indices)
+        total_size = len(indices)
+        train_size = int(0.9 * total_size)
+        train_indices.extend(indices[:train_size])
+        val_indices.extend(indices[train_size:])
+
+    train_data = Subset(partition, train_indices)
+    val_data = Subset(partition, val_indices)
+    test_data = test_set
+
+    # Split train set into retrain and forget sets
+    class_indices = defaultdict(list)
+    for i, x in enumerate(train_data):
+        class_indices[x[1]].append(i)
+
+    forget_indices = []
+    retrain_indices = []
+
+    for cls, indices in class_indices.items():
+        if cls in forgetting_config:
+            random.shuffle(indices)
+            forget_count = int(len(indices) * forgetting_config[cls])
+            forget_indices.extend(indices[:forget_count])
+            retrain_indices.extend(indices[forget_count:])
+        else:
+            retrain_indices.extend(indices)
+
+    forgetset = Subset(train_data, forget_indices) if forget_indices else None
+    retrainset = Subset(train_data, retrain_indices) if retrain_indices else None
+
+    # Keep original forget set
+    original_forget_dataset = copy.deepcopy(forgetset) if forgetset else None
+    
+    # Apply unlearning transformations if specified
+    forget_clients = config.get("CLIENT_ID_TO_FORGET", [])
+    if partition_id in forget_clients and forgetset is not None:
+        unlearning_case = config.get("UNLEARNING_CASE", "NORMAL")
+        if unlearning_case == "CONFUSE":
+            map_confuse = config.get("MAP_CONFUSE", {})
+            forgetset = confuse_the_forget_set(forgetset, map_confuse)
+            print(f"Client {partition_id}: Applied CONFUSE transformation")
+        elif unlearning_case == "BACKDOOR":
+            forgetset = backdoor_the_forget_set(forgetset)
+            print(f"Client {partition_id}: Applied BACKDOOR transformation")
+
+    # Create DataLoaders
+    retrain_batch = config.get("RETRAIN_BATCH", 64)
+    forget_batch = config.get("FORGET_BATCH", 32)
+    val_batch = config.get("VAL_BATCH", 128)
+    test_batch = config.get("TEST_BATCH", 128)
+
+    retrainloader = DataLoader(retrainset, batch_size=retrain_batch, shuffle=True) if retrainset and len(retrainset) > 0 else None
+    forgetloader = DataLoader(forgetset, batch_size=forget_batch, shuffle=True) if forgetset and len(forgetset) > 0 else None
+    original_forget_loader = DataLoader(original_forget_dataset, batch_size=forget_batch, shuffle=True) if original_forget_dataset and len(original_forget_dataset) > 0 else None
+    valloader = DataLoader(val_data, batch_size=val_batch, shuffle=True)
+    testloader = DataLoader(test_data, batch_size=test_batch, shuffle=True)
+
+    # Prepare partition info for saving
+    partition_info = {
+        'partition_id': partition_id,
+        'full_training_index': full_training_index,
+        'training_set_indices': train_indices,
+        'retrain_indices': retrain_indices,
+        'forget_indices': forget_indices,
+        'val_indices': val_indices,
+        'test_indices': test_index,
+    }
+    
+    # Save partition info if requested
+    if save_partition:
+        extended_config = {**config, 'num_partitions': num_partitions}
+        save_partition_info(
+            full_training_index,
+            train_indices,
+            retrain_indices,
+            forget_indices,
+            val_indices,
+            test_index,
+            extended_config,
+            partition_id,
+            partition_save_dir
+        )
+
+    return retrainloader, forgetloader, valloader, testloader, original_forget_loader, partition_info
+
+
+def load_datasets_from_partition(
+    partition_file: str,
+    dataset_name: str,
+    config: Dict,
+    forgetting_config: Dict = None
+) -> Tuple[Optional[DataLoader], Optional[DataLoader], DataLoader, DataLoader, Optional[DataLoader], Dict]:
+    """
+    Load datasets from saved partition file
+    
+    Args:
+        partition_file: Path to saved partition pickle file
+        dataset_name: Dataset name
+        config: Config dict
+        forgetting_config: Forgetting config (may override saved config)
+        
+    Returns:
+        retrainloader, forgetloader, valloader, testloader, original_forget_loader, partition_info
+    """
+    # Load partition info
+    with open(partition_file, 'rb') as f:
+        saved_data = pickle.load(f)
+    
+    partition_id = saved_data['partition_id']
+    full_training_index = saved_data['full_training_index']
+    training_set_indices = saved_data['training_set_indices']
+    retrain_indices = saved_data['retrain_indices']
+    forget_indices = saved_data['forget_indices']
+    val_indices = saved_data['val_indices']
+    test_indices = saved_data['test_indices']
+    
+    print(f"✓ Loaded partition for client {partition_id} from {partition_file}")
+    print(f"  Train: {len(retrain_indices)}, Forget: {len(forget_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    
+    # Load the actual dataset
+    if dataset_name.lower() == "cifar10":
+        dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transforms.ToTensor())
+        test_dataset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transforms.ToTensor())
+    elif dataset_name.lower() == "mnist":
+        dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
+        test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
+    elif dataset_name.lower() == "fashionmnist":
+        dataset = datasets.FashionMNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
+        test_dataset = datasets.FashionMNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
+    else:
+        raise ValueError("Unsupported dataset")
+    
+    # Reconstruct subsets using saved indices
+    partition = Subset(dataset, full_training_index)
+    train_data = Subset(partition, training_set_indices)
+    val_data = Subset(partition, val_indices)
+    test_data = Subset(test_dataset, test_indices)
+    
+    # Create forget and retrain sets
+    forgetset = Subset(train_data, forget_indices) if forget_indices else None
+    retrainset = Subset(train_data, retrain_indices) if retrain_indices else None
+    
+    # Keep original forget set
+    original_forget_dataset = copy.deepcopy(forgetset) if forgetset else None
+    
+    # Apply transformations if needed
+    forget_clients = config.get("CLIENT_ID_TO_FORGET", [])
+    if partition_id in forget_clients and forgetset is not None:
+        unlearning_case = config.get("UNLEARNING_CASE", "NORMAL")
+        if unlearning_case == "CONFUSE":
+            map_confuse = config.get("MAP_CONFUSE", {})
+            forgetset = confuse_the_forget_set(forgetset, map_confuse)
+            print(f"  Applied CONFUSE transformation")
+        elif unlearning_case == "BACKDOOR":
+            forgetset = backdoor_the_forget_set(forgetset)
+            print(f"  Applied BACKDOOR transformation")
+    
+    # Create DataLoaders
+    retrain_batch = config.get("RETRAIN_BATCH", 64)
+    forget_batch = config.get("FORGET_BATCH", 32)
+    val_batch = config.get("VAL_BATCH", 128)
+    test_batch = config.get("TEST_BATCH", 128)
+
+    retrainloader = DataLoader(retrainset, batch_size=retrain_batch, shuffle=True) if retrainset and len(retrainset) > 0 else None
+    forgetloader = DataLoader(forgetset, batch_size=forget_batch, shuffle=True) if forgetset and len(forgetset) > 0 else None
+    original_forget_loader = DataLoader(original_forget_dataset, batch_size=forget_batch, shuffle=True) if original_forget_dataset and len(original_forget_dataset) > 0 else None
+    valloader = DataLoader(val_data, batch_size=val_batch, shuffle=True)
+    testloader = DataLoader(test_data, batch_size=test_batch, shuffle=True)
+    
+    # Return partition info
+    partition_info = {
+        'partition_id': partition_id,
+        'full_training_index': full_training_index,
+        'training_set_indices': training_set_indices,
+        'retrain_indices': retrain_indices,
+        'forget_indices': forget_indices,
+        'val_indices': val_indices,
+        'test_indices': test_indices,
+    }
+    
+    return retrainloader, forgetloader, valloader, testloader, original_forget_loader, partition_info

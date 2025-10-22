@@ -14,7 +14,8 @@ class FCUDataLoader:
         forgetting_config: Dict = None,
         config: Dict = None,
         save_partition: bool = True,
-        partition_save_dir: str = "./partition_info"
+        partition_save_dir: str = "./partition_info",
+        load_if_exists: bool = True  # NEW: Auto-load from disk if exists
     ):
         self.partition_id = partition_id
         self.num_partitions = num_partitions
@@ -23,7 +24,6 @@ class FCUDataLoader:
         self.forgetting_config = forgetting_config or {}
         self.config = config or {}
         
-        # Load datasets (now returns partition_info too)
         (
             self.retrainloader,
             self.forgetloader,
@@ -40,7 +40,8 @@ class FCUDataLoader:
             dataset_name=dataset_name,
             config=config,
             save_partition=save_partition,
-            partition_save_dir=partition_save_dir
+            partition_save_dir=partition_save_dir,
+            load_if_exists=load_if_exists  # NEW
         )
         
     def get_train_loader(self) -> Optional[DataLoader]:
