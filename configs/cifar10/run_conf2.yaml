@@ -22,7 +22,7 @@ eval_interval: 10
 # ============================================
 # Unlearning Configuration
 # ============================================
-unlearn_epochs: 10
+unlearn_epochs: 2
 unlearn_lr: 0.01
 lambda_mcu: 1.0        # Weight for Model-Contrastive Unlearning loss
 lambda_retain: 1.0     # Weight for retain loss on remaining data
