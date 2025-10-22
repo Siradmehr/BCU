@@ -1,3 +1,4 @@
+
 import argparse
 import yaml
 import torch
@@ -175,6 +176,54 @@ def verify_partition_consistency(dataloaders, partition_info_all):
     return all_consistent
 
 
+def get_client_forgetting_config(client_id, config, excluded_clients=None):
+    """
+    Get forgetting configuration for a specific client
+    Supports multiple methods: CLIENT_POISONING_CONFIG, CLIENTS_TO_POISON, ATTACK_ALL_CLIENTS
+    
+    Args:
+        client_id: Client ID
+        config: Global config dict
+        excluded_clients: List of excluded client IDs (for legacy behavior)
+        
+    Returns:
+        dict: Forgetting config for this client, or {} if client is clean
+    """
+    # METHOD 1: Check if using CLIENT_POISONING_CONFIG (advanced - per-client control)
+    if 'CLIENT_POISONING_CONFIG' in config:
+        client_poison_config = config['CLIENT_POISONING_CONFIG']
+        
+        if client_id in client_poison_config:
+            # This client has specific poisoning config
+            return client_poison_config[client_id].get('classes', {})
+        else:
+            # Client not in config = clean client
+            return {}
+    
+    # METHOD 2: Check if using CLIENTS_TO_POISON (simple - same config for selected clients)
+    elif 'CLIENTS_TO_POISON' in config:
+        clients_to_poison = config['CLIENTS_TO_POISON']
+        
+        if client_id in clients_to_poison:
+            # This client gets poisoned with global forgetting_config
+            return config.get('forgetting_config', {})
+        else:
+            # Client not in list = clean client
+            return {}
+    
+    # METHOD 3: Legacy behavior - use ATTACK_ALL_CLIENTS flag
+    elif config.get('ATTACK_ALL_CLIENTS', False):
+        # All clients get poisoned
+        return config.get('forgetting_config', {})
+    
+    # METHOD 4: Only excluded clients get poisoned (legacy)
+    else:
+        if excluded_clients and client_id in excluded_clients:
+            return config.get('forgetting_config', {})
+        else:
+            return {}
+
+
 def print_unlearning_scenario(config, excluded_clients):
     """Print clear explanation of unlearning scenario"""
     mode = config.get('UNLEARNING_MODE', 'DATA_LEVEL')
@@ -202,6 +251,47 @@ def print_unlearning_scenario(config, excluded_clients):
         print("            (including target clients' retrain set)")
         print("\nUse case: Remove backdoor samples, fix label-flipping,")
         print("          remove specific poisoned classes")
+    
+    print("="*60)
+
+
+def print_poisoning_summary(dataloaders, config):
+    """
+    Print summary of which clients are poisoned and how
+    
+    Args:
+        dataloaders: List of all dataloaders
+        config: Config dict
+    """
+    print("\n" + "="*60)
+    print("CLIENT POISONING SUMMARY")
+    print("="*60)
+    
+    poisoned_clients = []
+    clean_clients = []
+    poisoning_details = {}
+    
+    for dataloader in dataloaders:
+        client_id = dataloader.partition_id
+        forget_size = len(dataloader.forgetloader.dataset) if dataloader.forgetloader else 0
+        train_size = len(dataloader.retrainloader.dataset) if dataloader.retrainloader else 0
+        
+        if forget_size > 0:
+            poisoned_clients.append(client_id)
+            poison_ratio = forget_size / (forget_size + train_size) if (forget_size + train_size) > 0 else 0
+            poisoning_details[client_id] = (forget_size, poison_ratio)
+            print(f"Client {client_id:2d}: ⚠ POISONED - {forget_size:4d} poisoned samples ({poison_ratio*100:.1f}%)")
+        else:
+            clean_clients.append(client_id)
+            print(f"Client {client_id:2d}: ✓ CLEAN - no poisoned data")
+    
+    print("-" * 60)
+    print(f"Poisoned clients: {len(poisoned_clients)}/{len(dataloaders)} - {poisoned_clients}")
+    print(f"Clean clients:    {len(clean_clients)}/{len(dataloaders)} - {clean_clients}")
+    
+    if poisoning_details:
+        total_poisoned = sum(count for count, _ in poisoning_details.values())
+        print(f"Total poisoned samples: {total_poisoned}")
     
     print("="*60)
 
@@ -406,7 +496,6 @@ def train_federated(config, dataloaders, device):
     """Federated learning training phase"""
     print(f"\nStarting FL training on {device}")
     print(f"Attack type: {config.get('UNLEARNING_CASE', 'NORMAL')}")
-    print(f"Attack ALL clients: {config.get('ATTACK_ALL_CLIENTS', False)}")
     
     # Initialize global model
     model = SimpleResNet18(num_classes=config['num_classes']).to(device)
@@ -783,7 +872,7 @@ def apply_fgmp(model, trained_model, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='FCU Training with Client-Level and Data-Level Unlearning')
+    parser = argparse.ArgumentParser(description='FCU Training with Client-Specific Poisoning Control')
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--excluded_clients', type=int, nargs='+', default=[0], 
                        help='Client IDs to unlearn')
@@ -792,7 +881,7 @@ def main():
     parser.add_argument('--attack_type', type=str, choices=['NORMAL', 'CONFUSE', 'BACKDOOR'],
                        help='Override attack type from config')
     parser.add_argument('--attack_all', action='store_true',
-                       help='Apply attack to all clients')
+                       help='Apply attack to all clients (deprecated, use config)')
     
     # Model loading arguments
     parser.add_argument('--load_model', type=str, default=None,
@@ -812,19 +901,36 @@ def main():
     parser.add_argument('--unlearn_mode', type=str, choices=['CLIENT_LEVEL', 'DATA_LEVEL'],
                        help='Override unlearning mode from config')
     
+    # NEW: Client-specific poisoning control (CLI override)
+    parser.add_argument('--poison_clients', type=int, nargs='+', default=None,
+                       help='Client IDs to poison (overrides config)')
+    parser.add_argument('--poison_ratio', type=float, default=0.3,
+                       help='Poisoning ratio for --poison_clients')
+    parser.add_argument('--poison_classes', type=int, nargs='+', default=[0, 1],
+                       help='Classes to poison for --poison_clients')
+    
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Override settings
+    # Override with CLI arguments if provided
     if args.attack_type:
         config['UNLEARNING_CASE'] = args.attack_type
     if args.attack_all:
         config['ATTACK_ALL_CLIENTS'] = True
     if args.unlearn_mode:
         config['UNLEARNING_MODE'] = args.unlearn_mode
+    
+    # Override poisoning config via CLI
+    if args.poison_clients:
+        print(f"\nOverriding config with CLI: Poisoning clients {args.poison_clients}")
+        config['CLIENT_POISONING_CONFIG'] = {}
+        for client_id in args.poison_clients:
+            config['CLIENT_POISONING_CONFIG'][client_id] = {
+                'classes': {cls: args.poison_ratio for cls in args.poison_classes}
+            }
     
     # Set seed
     set_seed(config['SEED'])
@@ -861,25 +967,28 @@ def main():
     if args.is_unlearn:
         print_unlearning_scenario(config, args.excluded_clients)
     
-    # Create dataloaders with partition saving/loading
-    print("\nCreating dataloaders...")
+    # Create dataloaders with CLIENT-SPECIFIC poisoning
+    print("\nCreating dataloaders with client-specific poisoning...")
     dataloaders = []
-    attack_all_clients = config.get('ATTACK_ALL_CLIENTS', False)
     
     for client_id in range(config['num_clients']):
-        if attack_all_clients:
-            forgetting_config = config.get('forgetting_config', {})
-        elif client_id in args.excluded_clients:
-            forgetting_config = config.get('forgetting_config', {})
+        # Get client-specific forgetting config
+        client_forgetting_config = get_client_forgetting_config(
+            client_id, config, args.excluded_clients
+        )
+        
+        # Print what we're doing for this client
+        if client_forgetting_config:
+            print(f"Client {client_id}: Poisoning classes {client_forgetting_config}")
         else:
-            forgetting_config = {}
+            print(f"Client {client_id}: Clean (no poisoning)")
         
         loader = FCUDataLoader(
             partition_id=client_id,
             num_partitions=config['num_clients'],
             dataset_name=config['dataset'],
             seed=config['SEED'],
-            forgetting_config=forgetting_config,
+            forgetting_config=client_forgetting_config,  # Client-specific config
             config=config,
             save_partition=True,
             partition_save_dir=args.partition_dir,
@@ -887,7 +996,10 @@ def main():
         )
         dataloaders.append(loader)
     
-    print(f"✓ Created dataloaders for {len(dataloaders)} clients")
+    print(f"\n✓ Created dataloaders for {len(dataloaders)} clients")
+    
+    # Print poisoning summary
+    print_poisoning_summary(dataloaders, config)
     
     # Print client summary
     print_client_summary(dataloaders, args.excluded_clients, config)
@@ -928,7 +1040,19 @@ def main():
         save_dir.mkdir(exist_ok=True)
         
         attack_suffix = config.get('UNLEARNING_CASE', 'normal').lower()
-        attack_scope = "all" if config.get('ATTACK_ALL_CLIENTS', False) else "partial"
+        
+        # Determine scope based on poisoning config
+        if 'CLIENT_POISONING_CONFIG' in config:
+            num_poisoned = len(config['CLIENT_POISONING_CONFIG'])
+            attack_scope = f"{num_poisoned}clients"
+        elif 'CLIENTS_TO_POISON' in config:
+            num_poisoned = len(config['CLIENTS_TO_POISON'])
+            attack_scope = f"{num_poisoned}clients"
+        elif config.get('ATTACK_ALL_CLIENTS', False):
+            attack_scope = "all"
+        else:
+            attack_scope = "partial"
+        
         model_path = save_dir / f"trained_model_{attack_suffix}_{attack_scope}.pth"
         
         save_checkpoint(model, None, config['num_rounds'], dataloaders, model_path, config)
@@ -956,7 +1080,18 @@ def main():
         save_dir = Path("checkpoints")
         mode_suffix = config.get('UNLEARNING_MODE', 'data').lower()
         attack_suffix = config.get('UNLEARNING_CASE', 'normal').lower()
-        attack_scope = "all" if config.get('ATTACK_ALL_CLIENTS', False) else "partial"
+        
+        if 'CLIENT_POISONING_CONFIG' in config:
+            num_poisoned = len(config['CLIENT_POISONING_CONFIG'])
+            attack_scope = f"{num_poisoned}clients"
+        elif 'CLIENTS_TO_POISON' in config:
+            num_poisoned = len(config['CLIENTS_TO_POISON'])
+            attack_scope = f"{num_poisoned}clients"
+        elif config.get('ATTACK_ALL_CLIENTS', False):
+            attack_scope = "all"
+        else:
+            attack_scope = "partial"
+        
         unlearn_path = save_dir / f"unlearned_{mode_suffix}_{attack_suffix}_{attack_scope}.pth"
         
         save_checkpoint(model, None, config['num_rounds'] + config.get('unlearn_epochs', 50),

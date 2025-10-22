@@ -1,64 +1,107 @@
 # ============================================
-# CLIENT-LEVEL UNLEARNING - NORMAL SCENARIO
-# Remove entire client(s) from federation
+# CLIENT-LEVEL UNLEARNING - MIXED POISONED/CLEAN CLIENTS
+# Remove entire clients completely from federation
+# Some clients are poisoned during training, then completely removed
 # ============================================
 
-# Dataset configuration
 dataset: "cifar10"
 num_classes: 10
 num_clients: 10
 model: "resnet18"
 
+# ============================================
 # Federated Learning Training
-num_rounds: 100
-local_epochs: 5
+# ============================================
+num_rounds: 2
+local_epochs: 2
 learning_rate: 0.01
 momentum: 0.9
 weight_decay: 0.0005
 eval_interval: 10
 
-# Unlearning configuration
-unlearn_epochs: 50
+# ============================================
+# Unlearning Configuration
+# ============================================
+unlearn_epochs: 10
 unlearn_lr: 0.01
 lambda_mcu: 1.0        # Weight for Model-Contrastive Unlearning loss
 lambda_retain: 1.0     # Weight for retain loss on remaining data
-lambda_fgmp: 0.1       # Weight for FGMP (not directly used but kept for compatibility)
+lambda_fgmp: 0.1       # Weight for FGMP
 T_fgmp: 10             # Apply FGMP every 10 iterations
-
-forgetting_config:
-  0: 0.3  # 30% backdoored during training
-  1: 0.3
-  2 : 0.3
-  3 : 0.3
-  4 : 0.3
-  5 : 0.3
-  6 : 0.3
-  7 : 0.3
-  8 : 0.3
-  9 : 0.3
 
 # ============================================
 # UNLEARNING MODE
 # ============================================
 UNLEARNING_MODE: "CLIENT_LEVEL"
-# CLIENT_LEVEL: Remove entire client(s) with all their data
-# Use case: Client leaves federation, GDPR request, remove malicious client
+# CLIENT_LEVEL: Remove ENTIRE client(s) with ALL their data
+# Use case: Client leaves federation, GDPR request, remove malicious client completely
 
-# For CLIENT_LEVEL: forgetting_config not needed (entire client removed)
-forgetting_config: {}
+# ============================================
+# CLIENT-SPECIFIC POISONING CONFIGURATION
+# ============================================
+# During training phase:
+#   - Clients 0, 5, 9 are malicious with poisoned data
+#   - Clients 1, 2, 3, 4, 6, 7, 8 are clean
+#
+# During unlearning phase (CLIENT_LEVEL):
+#   - Remove clients 0, 5, 9 COMPLETELY (all their data)
+#   - Keep clients 1-4, 6-8 completely
+#
+# Note: In CLIENT_LEVEL mode, even clean data from target clients is removed
+CLIENT_POISONING_CONFIG:
+  0:  # Malicious client 1 - will be completely removed
+    classes:
+      0: 0.4  # 40% of "airplane" samples backdoored
+      1: 0.4  # 40% of "automobile" samples backdoored
+      2: 0.4  # 40% of "bird" samples backdoored
+      3: 0.4  # 40% of "cat" samples backdoored
+      4: 0.4  # 40% of "deer" samples backdoored
+      5: 0.4  # 40% of "dog" samples backdoored
+      6: 0.4  # 40% of "frog" samples backdoored
+      7: 0.4  # 40% of "horse" samples backdoored
+      8: 0.4  # 40% of "ship" samples backdoored
+      9: 0.4  # 40% of "truck" samples backdoored
+      # During unlearning: ALL data (poisoned + clean) from client 0 removed
+  
+  # 5:  # Malicious client 2 - will be completely removed
+  #   classes:
+  #     0: 0.3  # 30% of "airplane" samples backdoored
+  #     1: 0.3  # 30% of "automobile" samples backdoored
+  #     2: 0.3  # 30% of "bird" samples backdoored
+  #     # During unlearning: ALL data (poisoned + clean) from client 5 removed
+  
+  # 9:  # Malicious client 3 - will be completely removed
+  #   classes:
+  #     0: 0.5  # 50% of "airplane" samples backdoored
+  #     1: 0.5  # 50% of "automobile" samples backdoored
+  #     # During unlearning: ALL data (poisoned + clean) from client 9 removed
 
-# Batch sizes
+# Clients 1, 2, 3, 4, 6, 7, 8 are completely clean
+# These clients are NOT listed above → no poisoning during training
+# These clients are NOT in CLIENT_ID_TO_FORGET → kept after unlearning
+
+# ============================================
+# Batch Sizes
+# ============================================
 RETRAIN_BATCH: 64
 FORGET_BATCH: 32
 VAL_BATCH: 128
 TEST_BATCH: 128
 
-# Attack configuration (if any during training)
-UNLEARNING_CASE: "BACKDOOR"  # No attack, just remove client
-CLIENT_ID_TO_FORGET: [0]   # Will be overridden by --excluded_clients
-ATTACK_ALL_CLIENTS: false
+# ============================================
+# Attack Configuration
+# ============================================
+UNLEARNING_CASE: "BACKDOOR"
+CLIENT_ID_TO_FORGET: [0]  # Remove these 3 clients COMPLETELY
 
-# System configuration
+# Backdoor trigger settings (applied during training phase)
+BACKDOOR_TARGET_LABEL: 0  # All backdoored samples → class 0 (airplane)
+BACKDOOR_TRIGGER_SIZE: 5   # 5x5 pixel white square
+BACKDOOR_TRIGGER_VALUE: 1.0
+
+# ============================================
+# System Configuration
+# ============================================
 SEED: 42
 device: "auto"  # auto-detect: mps/cuda/cpu
-num_workers: 0
+num_workers: 2
