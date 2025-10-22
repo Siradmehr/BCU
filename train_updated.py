@@ -37,10 +37,10 @@ def set_seed(seed: int):
 
 class SimpleResNet18(nn.Module):
     """Simple ResNet18 for CIFAR-10/MNIST/FashionMNIST"""
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10, pretrained=False):
         super().__init__()
         import torchvision.models as models
-        self.backbone = models.resnet18(pretrained=False, num_classes=num_classes)
+        self.backbone = models.resnet18(pretrained=pretrained, num_classes=num_classes)
         
         # Adjust first conv for CIFAR-10 (32x32) / MNIST (28x28)
         self.backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
@@ -64,7 +64,6 @@ class SimpleResNet18(nn.Module):
         x = self.backbone.avgpool(x)
         x = torch.flatten(x, 1)
         return x
-
 
 def save_checkpoint(model, optimizer, epoch, dataloaders, path, config=None):
     """
@@ -617,7 +616,7 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
     print()
     
     # Create reference model (downgraded: ImageNet pretrained init)
-    reference_model = SimpleResNet18(num_classes=config['num_classes']).to(device)
+    reference_model = SimpleResNet18(num_classes=config['num_classes'], pretrained=True).to(device)
     reference_model.eval()
     print("✓ Reference model (downgraded pretrained) created for MCU")
     
