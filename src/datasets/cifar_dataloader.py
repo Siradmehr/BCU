@@ -1,11 +1,7 @@
-"""
-Your complete dataloader code exactly as provided
-Balanced partitioning with forgetting support for CIFAR-10, MNIST, FashionMNIST
-"""
-
 import copy
 import random
 import os
+import pickle
 from collections import defaultdict
 from typing import Dict, Tuple, Optional
 
@@ -15,6 +11,115 @@ from torch.utils.data import DataLoader, Subset, ConcatDataset, Dataset
 from torchvision import datasets
 
 from .transformers_utils import confuse_the_forget_set, backdoor_the_forget_set
+
+
+def save_partition_info(
+    full_training_index,
+    training_set_indices,
+    retrain_indices,
+    forget_indices,
+    val_indices,
+    test_indices,
+    config,
+    partition_id,
+    save_dir="./partition_info"
+):
+    """
+    Save partition information for reproducibility
+    
+    Args:
+        full_training_index: All training indices for this client
+        training_set_indices: Training set indices (before forget/retrain split)
+        retrain_indices: Indices for retrain set
+        forget_indices: Indices for forget set
+        val_indices: Validation indices
+        test_indices: Test indices
+        config: Configuration dict
+        partition_id: Client ID
+        save_dir: Directory to save partition info
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    partition_data = {
+        'partition_id': partition_id,
+        'full_training_index': full_training_index,
+        'training_set_indices': training_set_indices,
+        'retrain_indices': retrain_indices,
+        'forget_indices': forget_indices,
+        'val_indices': val_indices,
+        'test_indices': test_indices,
+        'config': {
+            'dataset_name': config.get('dataset', 'cifar10'),
+            'num_clients': config.get('num_partitions', 10),
+            'seed': config.get('SEED', 42),
+            'forgetting_config': config.get('forgetting_config', {}),
+            'unlearning_case': config.get('UNLEARNING_CASE', 'NORMAL'),
+            'attack_all_clients': config.get('ATTACK_ALL_CLIENTS', False),
+        }
+    }
+    
+    save_path = os.path.join(save_dir, f"partition_client_{partition_id}.pkl")
+    with open(save_path, 'wb') as f:
+        pickle.dump(partition_data, f)
+    
+    print(f"✓ Partition info saved for client {partition_id} to {save_path}")
+
+
+def load_partition_info(partition_id, save_dir="./partition_info"):
+    """
+    Load partition information from disk
+    
+    Args:
+        partition_id: Client ID
+        save_dir: Directory containing partition info
+        
+    Returns:
+        dict with partition indices and config
+    """
+    save_path = os.path.join(save_dir, f"partition_client_{partition_id}.pkl")
+    
+    if not os.path.exists(save_path):
+        raise FileNotFoundError(f"Partition info not found at {save_path}")
+    
+    with open(save_path, 'rb') as f:
+        partition_data = pickle.load(f)
+    
+    print(f"✓ Partition info loaded for client {partition_id} from {save_path}")
+    return partition_data
+
+
+def save_all_partitions_summary(dataloaders, config, save_dir="./partition_info"):
+    """
+    Save summary of all client partitions
+    
+    Args:
+        dataloaders: List of all dataloaders
+        config: Configuration dict
+        save_dir: Directory to save summary
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    summary = {
+        'num_clients': len(dataloaders),
+        'config': config,
+        'client_stats': []
+    }
+    
+    for client_id, dataloader in enumerate(dataloaders):
+        stats = {
+            'client_id': client_id,
+            'train_samples': len(dataloader.retrainloader.dataset) if dataloader.retrainloader else 0,
+            'forget_samples': len(dataloader.forgetloader.dataset) if dataloader.forgetloader else 0,
+            'val_samples': len(dataloader.valloader.dataset) if dataloader.valloader else 0,
+            'test_samples': len(dataloader.testloader.dataset) if dataloader.testloader else 0,
+        }
+        summary['client_stats'].append(stats)
+    
+    save_path = os.path.join(save_dir, "partition_summary.pkl")
+    with open(save_path, 'wb') as f:
+        pickle.dump(summary, f)
+    
+    print(f"✓ Partition summary saved to {save_path}")
 
 
 def _partition_dataset(dataset, num_partitions, partition_id, shuffle):
@@ -53,17 +158,10 @@ def configure_balanced_partition(
     seed: int,
     shuffle: bool
 ) -> Tuple[Subset, list, Subset, list]:
-    """
-    Load a dataset and partition it with balanced class distribution
-    
-    Returns:
-        training_set, full_training_index, test_set, test_index
-    """
-    # Set seed
+    """Load a dataset and partition it with balanced class distribution"""
     random.seed(seed)
     torch.manual_seed(seed)
     
-    # Load dataset
     if dataset_name.lower() == "cifar10":
         dataset = datasets.CIFAR10(root=root, train=True, download=True, transform=transforms.ToTensor())
         test_dataset = datasets.CIFAR10(root=root, train=False, download=True, transform=transforms.ToTensor())
@@ -92,29 +190,23 @@ def load_datasets_with_forgetting(
     shuffle: bool = True,
     forgetting_config: Dict = None,
     dataset_name: str = "cifar10",
-    config: Dict = None
-) -> Tuple[Optional[DataLoader], Optional[DataLoader], DataLoader, DataLoader, Optional[DataLoader]]:
+    config: Dict = None,
+    save_partition: bool = True,
+    partition_save_dir: str = "./partition_info"
+) -> Tuple[Optional[DataLoader], Optional[DataLoader], DataLoader, DataLoader, Optional[DataLoader], Dict]:
     """
     Load and partition datasets with forgetting functionality
     
-    Args:
-        partition_id: Client ID
-        num_partitions: Total number of clients
-        seed: Random seed
-        shuffle: Whether to shuffle data
-        forgetting_config: Dict mapping class labels to forgetting ratios
-        dataset_name: Name of dataset (cifar10, mnist, fashionmnist)
-        config: Configuration dictionary with batch sizes and unlearning settings
-        
+    NEW: Returns partition_info dict for saving with checkpoint
+    
     Returns:
-        retrainloader, forgetloader, valloader, testloader, original_forget_loader
+        retrainloader, forgetloader, valloader, testloader, original_forget_loader, partition_info
     """
     if forgetting_config is None:
         forgetting_config = {}
     if config is None:
         config = {}
     
-    # Set seed
     random.seed(seed)
     torch.manual_seed(seed)
     
@@ -193,9 +285,36 @@ def load_datasets_with_forgetting(
     valloader = DataLoader(val_data, batch_size=val_batch, shuffle=True)
     testloader = DataLoader(test_data, batch_size=test_batch, shuffle=True)
 
-    return retrainloader, forgetloader, valloader, testloader, original_forget_loader
+    # Prepare partition info for saving
+    partition_info = {
+        'partition_id': partition_id,
+        'full_training_index': full_training_index,
+        'training_set_indices': train_indices,
+        'retrain_indices': retrain_indices,
+        'forget_indices': forget_indices,
+        'val_indices': val_indices,
+        'test_indices': test_index,
+    }
+    
+    # Save partition info if requested
+    if save_partition:
+        extended_config = {**config, 'num_partitions': num_partitions}
+        save_partition_info(
+            full_training_index,
+            train_indices,
+            retrain_indices,
+            forget_indices,
+            val_indices,
+            test_index,
+            extended_config,
+            partition_id,
+            partition_save_dir
+        )
+
+    return retrainloader, forgetloader, valloader, testloader, original_forget_loader, partition_info
 
 
+# Keep other helper classes (MembershipDataset, etc.)
 class MembershipDataset(Dataset):
     """Dataset wrapper that adds membership labels"""
     def __init__(self, dataset, is_member):
@@ -211,9 +330,7 @@ class MembershipDataset(Dataset):
 
 
 def create_attack_and_shadow_loaders(forgetloader, testloader, valloader, batch_size=64):
-    """
-    Create attack_loader and shadow_loader for membership inference attacks
-    """
+    """Create attack_loader and shadow_loader for membership inference attacks"""
     forget_dataset_with_membership = MembershipDataset(forgetloader.dataset, is_member=1)
     test_dataset_with_membership = MembershipDataset(testloader.dataset, is_member=0)
     combined_dataset = ConcatDataset([forget_dataset_with_membership, test_dataset_with_membership])

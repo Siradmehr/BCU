@@ -80,18 +80,6 @@ def load_model(model_path, device, num_classes=10):
         raise
 
 
-def save_checkpoint(model, optimizer, epoch, path, config=None):
-    """Save a comprehensive checkpoint"""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
-        'config': config
-    }
-    torch.save(checkpoint, path)
-    print(f"✓ Checkpoint saved to {path}")
-
-
 def add_backdoor_trigger(data, config):
     """Add backdoor trigger to data"""
     trigger_size = config.get('BACKDOOR_TRIGGER_SIZE', 5)
@@ -364,24 +352,134 @@ def unlearn_with_fcu(model, target_dataloaders, config, device):
     print(f"✓ Unlearning completed")
     return model
 
+def save_checkpoint(model, optimizer, epoch, dataloaders, path, config=None):
+    """
+    Save a comprehensive checkpoint including partition info
+    
+    Args:
+        model: Model to save
+        optimizer: Optimizer state
+        epoch: Current epoch/round
+        dataloaders: List of dataloaders (to extract partition info)
+        path: Save path
+        config: Configuration dict
+    """
+    # Collect partition info from all clients
+    partition_info_all = {}
+    for dataloader in dataloaders:
+        partition_info = dataloader.get_partition_info()
+        partition_info_all[partition_info['partition_id']] = partition_info
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+        'config': config,
+        'partition_info': partition_info_all,  # NEW: Save partition info
+        'num_clients': len(dataloaders)
+    }
+    torch.save(checkpoint, path)
+    print(f"✓ Checkpoint saved to {path}")
+    print(f"  - Includes partition info for {len(partition_info_all)} clients")
+
+
+def load_checkpoint_with_partitions(checkpoint_path, device):
+    """
+    Load checkpoint and return model + partition info
+    
+    Returns:
+        model, config, partition_info_all
+    """
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Extract config
+    config = checkpoint.get('config', {})
+    num_classes = config.get('num_classes', 10)
+    
+    # Load model
+    model = SimpleResNet18(num_classes=num_classes).to(device)
+    
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    # Extract partition info
+    partition_info_all = checkpoint.get('partition_info', None)
+    
+    print(f"✓ Checkpoint loaded successfully")
+    if partition_info_all:
+        print(f"  - Loaded partition info for {len(partition_info_all)} clients")
+    else:
+        print(f"  - Warning: No partition info found in checkpoint")
+    
+    return model, config, partition_info_all
+
+
+def verify_partition_consistency(dataloaders, partition_info_all):
+    """
+    Verify that current dataloaders match saved partition info
+    
+    Args:
+        dataloaders: Current dataloaders
+        partition_info_all: Partition info from checkpoint
+        
+    Returns:
+        bool: True if consistent
+    """
+    if partition_info_all is None:
+        print("Warning: No saved partition info to verify against")
+        return True
+    
+    print("\nVerifying partition consistency...")
+    all_consistent = True
+    
+    for dataloader in dataloaders:
+        current_info = dataloader.get_partition_info()
+        client_id = current_info['partition_id']
+        
+        if client_id not in partition_info_all:
+            print(f"  Client {client_id}: No saved partition info found")
+            all_consistent = False
+            continue
+        
+        saved_info = partition_info_all[client_id]
+        
+        # Compare key indices
+        checks = [
+            ('full_training_index', current_info['full_training_index'], saved_info['full_training_index']),
+            ('retrain_indices', current_info['retrain_indices'], saved_info['retrain_indices']),
+            ('forget_indices', current_info['forget_indices'], saved_info['forget_indices']),
+        ]
+        
+        client_consistent = True
+        for name, current, saved in checks:
+            if current != saved:
+                print(f"  Client {client_id}: {name} MISMATCH")
+                client_consistent = False
+                all_consistent = False
+        
+        if client_consistent:
+            print(f"  Client {client_id}: ✓ Consistent")
+    
+    return all_consistent
 
 def main():
-    parser = argparse.ArgumentParser(description='FCU Training with Model Loading Support')
-    parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--excluded_clients', type=int, nargs='+', default=[0], 
-                       help='Client IDs to unlearn')
-    parser.add_argument('--is_unlearn', type=int, default=0, 
-                       help='1 for unlearning phase, 0 for training only')
-    parser.add_argument('--attack_type', type=str, choices=['NORMAL', 'CONFUSE', 'BACKDOOR'],
-                       help='Override attack type from config')
-    parser.add_argument('--attack_all', action='store_true',
-                       help='Apply attack to all clients')
+    parser = argparse.ArgumentParser(description='FCU Training with Partition Saving/Loading')
+    parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--excluded_clients', type=int, nargs='+', default=[0])
+    parser.add_argument('--is_unlearn', type=int, default=0)
+    parser.add_argument('--attack_type', type=str, choices=['NORMAL', 'CONFUSE', 'BACKDOOR'])
+    parser.add_argument('--attack_all', action='store_true')
+    parser.add_argument('--load_model', type=str, default=None)
+    parser.add_argument('--skip_training', action='store_true')
     
-    # NEW: Model loading arguments
-    parser.add_argument('--load_model', type=str, default=None,
-                       help='Path to pre-trained model to load (skip training phase)')
-    parser.add_argument('--skip_training', action='store_true',
-                       help='Skip federated training phase, only do unlearning')
+    # NEW: Partition control
+    parser.add_argument('--partition_dir', type=str, default='./partition_info',
+                       help='Directory to save/load partition info')
+    parser.add_argument('--verify_partitions', action='store_true',
+                       help='Verify loaded partitions match saved ones')
     
     args = parser.parse_args()
     
@@ -389,34 +487,22 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Override settings
     if args.attack_type:
         config['UNLEARNING_CASE'] = args.attack_type
     if args.attack_all:
         config['ATTACK_ALL_CLIENTS'] = True
     
-    # Set seed
     set_seed(config['SEED'])
-    
-    # Get device
     device = get_device(config.get('device', 'auto'))
-    print(f"Using device: {device}")
     
-    # Print experiment setup
-    print("\n" + "="*60)
-    print(f"EXPERIMENT SETUP")
-    print("="*60)
+    print(f"\n{'='*60}")
+    print("EXPERIMENT SETUP")
+    print(f"{'='*60}")
     print(f"Dataset: {config['dataset']}")
-    print(f"Num Clients: {config['num_clients']}")
-    print(f"Unlearning Case: {config.get('UNLEARNING_CASE', 'NORMAL')}")
-    print(f"Attack ALL Clients: {config.get('ATTACK_ALL_CLIENTS', False)}")
-    print(f"Clients to Forget: {args.excluded_clients}")
-    print(f"Skip Training: {args.skip_training or args.load_model is not None}")
-    if args.load_model:
-        print(f"Load Model From: {args.load_model}")
-    print("="*60 + "\n")
+    print(f"Partition Directory: {args.partition_dir}")
+    print(f"{'='*60}\n")
     
-    # Create dataloaders
+    # Create dataloaders with partition saving
     dataloaders = []
     attack_all_clients = config.get('ATTACK_ALL_CLIENTS', False)
     
@@ -434,7 +520,9 @@ def main():
             dataset_name=config['dataset'],
             seed=config['SEED'],
             forgetting_config=forgetting_config,
-            config=config
+            config=config,
+            save_partition=True,  # Save partition info
+            partition_save_dir=args.partition_dir
         )
         dataloaders.append(loader)
     
@@ -442,24 +530,36 @@ def main():
     
     # PHASE 1: Training or Load Model
     if args.load_model:
-        # Load pre-trained model
-        print("="*60)
-        print("LOADING PRE-TRAINED MODEL")
-        print("="*60)
-        model = load_model(args.load_model, device, config['num_classes'])
+        print(f"{'='*60}")
+        print("LOADING PRE-TRAINED MODEL WITH PARTITIONS")
+        print(f"{'='*60}")
         
-        # Evaluate loaded model
+        model, saved_config, partition_info_all = load_checkpoint_with_partitions(
+            args.load_model, device
+        )
+        
+        # Verify partition consistency if requested
+        if args.verify_partitions and partition_info_all:
+            consistent = verify_partition_consistency(dataloaders, partition_info_all)
+            if not consistent:
+                print("\n⚠ Warning: Partition mismatch detected!")
+                print("The current data splits differ from the saved checkpoint.")
+                response = input("Continue anyway? (y/n): ")
+                if response.lower() != 'y':
+                    print("Aborted.")
+                    return
+        
         results = evaluate_model(model, dataloaders, device, config)
         print(f"Loaded Model Accuracy: {results['overall_acc']:.4f}\n")
         
     elif not args.skip_training:
-        # Train from scratch
-        print("="*60)
+        print(f"{'='*60}")
         print("PHASE 1: Federated Learning Training")
-        print("="*60)
+        print(f"{'='*60}")
+        
         model = train_federated(config, dataloaders, device)
         
-        # Save trained model
+        # Save model with partition info
         save_dir = Path("checkpoints")
         save_dir.mkdir(exist_ok=True)
         
@@ -467,61 +567,46 @@ def main():
         attack_scope = "all" if config.get('ATTACK_ALL_CLIENTS', False) else "partial"
         model_path = save_dir / f"trained_model_{attack_suffix}_{attack_scope}.pth"
         
-        save_checkpoint(model, None, config['num_rounds'], model_path, config)
-        print(f"\n✓ Model saved to {model_path}")
+        save_checkpoint(model, None, config['num_rounds'], dataloaders, model_path, config)
+        
+        # Also save standalone partition summary
+        from src.datasets.cifar_dataloader import save_all_partitions_summary
+        save_all_partitions_summary(dataloaders, config, args.partition_dir)
+        
     else:
         raise ValueError("Must either provide --load_model or allow training phase")
     
     # PHASE 2: Unlearning
     if args.is_unlearn:
-        print("\n" + "="*60)
+        print(f"\n{'='*60}")
         print("PHASE 2: Unlearning")
-        print("="*60)
+        print(f"{'='*60}")
         
-        # Get dataloaders for clients to unlearn
         target_dataloaders = [dataloaders[i] for i in args.excluded_clients]
-        
-        # Perform unlearning
         model = unlearn_with_fcu(model, target_dataloaders, config, device)
         
-        # Save unlearned model
+        # Save unlearned model with partition info
         save_dir = Path("checkpoints")
         attack_suffix = config.get('UNLEARNING_CASE', 'normal').lower()
         attack_scope = "all" if config.get('ATTACK_ALL_CLIENTS', False) else "partial"
         unlearn_path = save_dir / f"unlearned_model_{attack_suffix}_{attack_scope}.pth"
         
-        torch.save(model.state_dict(), unlearn_path)
-        print(f"\n✓ Unlearned model saved to {unlearn_path}")
+        save_checkpoint(model, None, config['num_rounds'] + config['unlearn_epochs'], 
+                       dataloaders, unlearn_path, config)
     
-    # Final Evaluation
-    print("\n" + "="*60)
+    # Final evaluation
+    print(f"\n{'='*60}")
     print("FINAL EVALUATION")
-    print("="*60)
+    print(f"{'='*60}")
     
     results = evaluate_model(model, dataloaders, device, config)
     print(f"Overall Accuracy: {results['overall_acc']:.4f}")
-    print(f"\nPer-class Accuracy:")
-    cifar10_classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
-                       'dog', 'frog', 'horse', 'ship', 'truck']
-    for cls, acc in sorted(results['class_acc'].items()):
-        print(f"  Class {cls} ({cifar10_classes[cls]}): {acc:.4f}")
     
-    unlearning_case = config.get('UNLEARNING_CASE', 'NORMAL')
-    
-    if unlearning_case == 'BACKDOOR':
-        backdoor_results = evaluate_backdoor_attack(model, dataloaders, device, config)
-        print(f"\nBackdoor Attack Success Rate: {backdoor_results['backdoor_asr']:.4f}")
-    
-    elif unlearning_case == 'CONFUSE':
-        confuse_results = evaluate_confuse_attack(model, dataloaders, device, config)
-        print(f"\nLabel-Flipping Attack Results:")
-        for key, val in confuse_results.items():
-            print(f"  {key}: {val:.4f}")
-    
-    print("\n" + "="*60)
+    print(f"\n{'='*60}")
     print("✓ Experiment Complete")
-    print("="*60)
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
     main()
+
