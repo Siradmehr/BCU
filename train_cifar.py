@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore", category=UserWarning,
 
 from src.datasets.fcu_adapter import FCUDataLoader
 from src.datasets.cifar_dataloader import save_all_partitions_summary
-from utils.device_utils import get_device
+from src.utils.device_utils import get_device
 
 
 def set_seed(seed: int):
