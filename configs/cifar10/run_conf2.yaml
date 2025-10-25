@@ -83,10 +83,10 @@ CLIENT_POISONING_CONFIG:
 # ============================================
 # Batch Sizes
 # ============================================
-RETRAIN_BATCH: 512
-FORGET_BATCH: 64
-VAL_BATCH: 512
-TEST_BATCH: 32
+RETRAIN_BATCH: 64
+FORGET_BATCH: 32
+VAL_BATCH: 128
+TEST_BATCH: 128
 
 # ============================================
 # Attack Configuration
