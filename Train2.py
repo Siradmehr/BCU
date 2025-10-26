@@ -3,6 +3,7 @@ Federated Client Unlearning (FCU) Training Script
 Implements Model-Contrastive Unlearning (MCU) + Frequency-Guided Memory Preservation (FGMP)
 Supports CIFAR-10/100/MNIST/FashionMNIST with backdoor and confusion attacks
 Uses NFResNet (Normalizer-Free ResNet) and other custom models
+Logs comprehensive accuracies: test, train, forget, validation sets
 """
 
 import argparse
@@ -16,6 +17,8 @@ import numpy as np
 from collections import defaultdict
 import os
 import warnings
+import csv
+from datetime import datetime
 
 # Suppress multiprocessing warnings
 warnings.filterwarnings("ignore", category=UserWarning, 
@@ -42,24 +45,12 @@ def set_seed(seed: int):
 
 
 def get_model(model_name: str, num_classes: int = 10, input_channels: int = 3):
-    """
-    Get model based on name
-    
-    Args:
-        model_name: Name of model architecture
-        num_classes: Number of output classes
-        input_channels: Number of input channels (3 for RGB, 1 for grayscale)
-        
-    Returns:
-        model: PyTorch model
-    """
+    """Get model based on name"""
     if model_name == "nf_resnet18":
         model = nf_resnet18(num_classes=num_classes)
-        # Adjust first conv for CIFAR/MNIST
         if input_channels != 3:
             model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         else:
-            # For CIFAR (32x32), use smaller kernel and no stride
             model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
             model.maxpool = nn.Identity()
         return model
@@ -89,13 +80,11 @@ def get_model(model_name: str, num_classes: int = 10, input_channels: int = 3):
         return FLNet(num_class=num_classes)
     
     elif model_name == "CNNCifar":
-        # Simple CNN for CIFAR
         class Args:
             num_classes = num_classes
         return CNNCifar(Args())
     
     elif model_name == "resnet18":
-        # Standard torchvision ResNet18
         import torchvision.models as models
         model = models.resnet18(pretrained=False, num_classes=num_classes)
         if input_channels != 3:
@@ -110,10 +99,7 @@ def get_model(model_name: str, num_classes: int = 10, input_channels: int = 3):
 
 
 class ModelWrapper(nn.Module):
-    """
-    Wrapper to provide consistent interface for all models
-    Adds get_features() method for MCU
-    """
+    """Wrapper to provide consistent interface for all models"""
     def __init__(self, base_model, model_name):
         super().__init__()
         self.base_model = base_model
@@ -125,7 +111,6 @@ class ModelWrapper(nn.Module):
     def get_features(self, x):
         """Extract features before final classification layer"""
         if self.model_name in ["nf_resnet18", "nf_resnet34", "nf_resnet50"]:
-            # NFResNet models
             x = self.base_model.conv1(x)
             x = self.base_model.relu(x)
             x = self.base_model.maxpool(x)
@@ -138,7 +123,6 @@ class ModelWrapper(nn.Module):
             return x
         
         elif self.model_name == "resnet18":
-            # Standard ResNet18
             x = self.base_model.conv1(x)
             x = self.base_model.bn1(x)
             x = self.base_model.relu(x)
@@ -152,7 +136,6 @@ class ModelWrapper(nn.Module):
             return x
         
         elif self.model_name == "LeNet5":
-            # LeNet5
             x = self.base_model.c1(x)
             x = self.base_model.c2_1(x)
             y = self.base_model.c2_2(self.base_model.c1.c1[2](self.base_model.c1.c1[1](self.base_model.c1.c1[0](x))))
@@ -163,7 +146,6 @@ class ModelWrapper(nn.Module):
             return x
         
         elif self.model_name == "FLNet":
-            # FLNet
             x = F.max_pool2d(F.relu(self.base_model.conv1(x)), 2)
             x = F.max_pool2d(F.relu(self.base_model.conv2(x)), 2)
             x = x.view(-1, x.shape[1]*x.shape[2]*x.shape[3])
@@ -171,7 +153,6 @@ class ModelWrapper(nn.Module):
             return x
         
         elif self.model_name == "CNNCifar":
-            # CNNCifar
             x = self.base_model.pool(F.relu(self.base_model.conv1(x)))
             x = self.base_model.pool(F.relu(self.base_model.conv2(x)))
             x = x.view(-1, 16 * 5 * 5)
@@ -180,8 +161,219 @@ class ModelWrapper(nn.Module):
             return x
         
         else:
-            # Fallback: try to get avgpool output
             raise NotImplementedError(f"get_features not implemented for {self.model_name}")
+
+
+def evaluate_on_loader(model, loader, device):
+    """
+    Evaluate model on a single dataloader
+    
+    Returns:
+        accuracy, total_samples
+    """
+    eval_model = model
+    if isinstance(model, nn.DataParallel):
+        eval_model = model.module
+    if isinstance(eval_model, ModelWrapper):
+        eval_model = eval_model.base_model
+    
+    eval_model.eval()
+    
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            output = eval_model(data)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+    
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy, total
+
+
+def evaluate_model_comprehensive(model, dataloaders, device, config=None):
+    """
+    Comprehensive evaluation on test, train, forget, and validation sets
+    
+    Returns:
+        dict with all accuracies
+    """
+    eval_model = model
+    if isinstance(model, nn.DataParallel):
+        eval_model = model.module
+    if isinstance(eval_model, ModelWrapper):
+        eval_model = eval_model.base_model
+    
+    eval_model.eval()
+    
+    # Test set accuracy
+    test_correct = 0
+    test_total = 0
+    
+    # Train set accuracy
+    train_correct = 0
+    train_total = 0
+    
+    # Forget set accuracy
+    forget_correct = 0
+    forget_total = 0
+    
+    # Validation set accuracy
+    val_correct = 0
+    val_total = 0
+    
+    class_correct = defaultdict(int)
+    class_total = defaultdict(int)
+    
+    with torch.no_grad():
+        for dataloader in dataloaders:
+            # Test set
+            test_loader = dataloader.get_test_loader()
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = eval_model(data)
+                pred = output.argmax(dim=1)
+                test_correct += pred.eq(target).sum().item()
+                test_total += target.size(0)
+                
+                # Class-wise accuracy on test set
+                for t, p in zip(target, pred):
+                    t_item = t.item()
+                    class_total[t_item] += 1
+                    if p.item() == t_item:
+                        class_correct[t_item] += 1
+            
+            # Train set (retrain loader)
+            train_loader = dataloader.get_train_loader()
+            if train_loader:
+                for data, target in train_loader:
+                    data, target = data.to(device), target.to(device)
+                    output = eval_model(data)
+                    pred = output.argmax(dim=1)
+                    train_correct += pred.eq(target).sum().item()
+                    train_total += target.size(0)
+            
+            # Forget set
+            forget_loader = dataloader.get_forget_loader()
+            if forget_loader:
+                for data, target in forget_loader:
+                    data, target = data.to(device), target.to(device)
+                    output = eval_model(data)
+                    pred = output.argmax(dim=1)
+                    forget_correct += pred.eq(target).sum().item()
+                    forget_total += target.size(0)
+            
+            # Validation set
+            val_loader = dataloader.get_val_loader()
+            if val_loader:
+                for data, target in val_loader:
+                    data, target = data.to(device), target.to(device)
+                    output = eval_model(data)
+                    pred = output.argmax(dim=1)
+                    val_correct += pred.eq(target).sum().item()
+                    val_total += target.size(0)
+    
+    test_acc = test_correct / test_total if test_total > 0 else 0.0
+    train_acc = train_correct / train_total if train_total > 0 else 0.0
+    forget_acc = forget_correct / forget_total if forget_total > 0 else 0.0
+    val_acc = val_correct / val_total if val_total > 0 else 0.0
+    
+    class_acc = {cls: class_correct[cls] / class_total[cls] 
+                 for cls in class_total.keys()}
+    
+    return {
+        'test_acc': test_acc,
+        'test_samples': test_total,
+        'train_acc': train_acc,
+        'train_samples': train_total,
+        'forget_acc': forget_acc,
+        'forget_samples': forget_total,
+        'val_acc': val_acc,
+        'val_samples': val_total,
+        'class_acc': class_acc,
+    }
+
+
+def save_accuracy_to_csv(results, phase, config, args):
+    """
+    Save comprehensive accuracy results to CSV file
+    
+    Args:
+        results: Dictionary with all evaluation results
+        phase: 'training' or 'unlearning'
+        config: Configuration dictionary
+        args: Command line arguments
+    """
+    results_dir = Path(config.get('results_dir', './results'))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset = config.get('dataset', 'unknown')
+    model_name = config.get('model_name', 'unknown')
+    attack_type = config.get('UNLEARNING_CASE', 'NORMAL')
+    
+    filename = f"{phase}_results_{dataset}_{model_name}_{attack_type}_{timestamp}.csv"
+    filepath = results_dir / filename
+    
+    # Prepare data to write
+    data = {
+        'timestamp': timestamp,
+        'phase': phase,
+        'dataset': dataset,
+        'model': model_name,
+        'attack_type': attack_type,
+        'num_clients': config.get('num_clients', 'N/A'),
+        'excluded_clients': str(args.excluded_clients),
+        
+        # Main accuracies
+        'test_acc': results.get('test_acc', 'N/A'),
+        'test_samples': results.get('test_samples', 'N/A'),
+        'train_acc': results.get('train_acc', 'N/A'),
+        'train_samples': results.get('train_samples', 'N/A'),
+        'forget_acc': results.get('forget_acc', 'N/A'),
+        'forget_samples': results.get('forget_samples', 'N/A'),
+        'val_acc': results.get('val_acc', 'N/A'),
+        'val_samples': results.get('val_samples', 'N/A'),
+    }
+    
+    # Add backdoor-specific metrics
+    if 'backdoor_asr' in results:
+        data['backdoor_asr'] = results['backdoor_asr']
+        data['backdoor_samples'] = results['backdoor_samples']
+        data['trigger_size'] = results.get('trigger_size', 'N/A')
+    
+    # Add class-wise accuracies if available
+    if 'class_acc' in results:
+        for cls, acc in results['class_acc'].items():
+            data[f'class_{cls}_acc'] = acc
+    
+    # Write to CSV
+    file_exists = filepath.exists()
+    
+    with open(filepath, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=data.keys())
+        
+        if not file_exists:
+            writer.writeheader()
+        
+        writer.writerow(data)
+    
+    print(f"\n{'='*60}")
+    print(f"RESULTS SAVED TO: {filepath}")
+    print(f"{'='*60}")
+    print(f"Phase: {phase.upper()}")
+    print(f"Test Accuracy:       {results.get('test_acc', 'N/A'):.4f} ({results.get('test_samples', 0)} samples)")
+    print(f"Train Accuracy:      {results.get('train_acc', 'N/A'):.4f} ({results.get('train_samples', 0)} samples)")
+    print(f"Forget Accuracy:     {results.get('forget_acc', 'N/A'):.4f} ({results.get('forget_samples', 0)} samples)")
+    print(f"Validation Accuracy: {results.get('val_acc', 'N/A'):.4f} ({results.get('val_samples', 0)} samples)")
+    if 'backdoor_asr' in results:
+        print(f"Backdoor ASR:        {results['backdoor_asr']:.4f}")
+    print(f"{'='*60}\n")
+    
+    return filepath
 
 
 def save_checkpoint(model, optimizer, epoch, dataloaders, path, config=None):
@@ -191,7 +383,6 @@ def save_checkpoint(model, optimizer, epoch, dataloaders, path, config=None):
         partition_info = dataloader.get_partition_info()
         partition_info_all[partition_info['partition_id']] = partition_info
     
-    # Unwrap model if wrapped
     if isinstance(model, ModelWrapper):
         model_state = model.base_model.state_dict()
     elif isinstance(model, nn.DataParallel):
@@ -214,7 +405,6 @@ def save_checkpoint(model, optimizer, epoch, dataloaders, path, config=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(checkpoint, path)
     print(f"✓ Checkpoint saved to {path}")
-    print(f"  - Includes partition info for {len(partition_info_all)} clients")
 
 
 def load_checkpoint_with_partitions(checkpoint_path, device, config):
@@ -226,11 +416,9 @@ def load_checkpoint_with_partitions(checkpoint_path, device, config):
     num_classes = saved_config.get('num_classes', config.get('num_classes', 10))
     model_name = saved_config.get('model_name', config.get('model_name', 'nf_resnet18'))
     
-    # Determine input channels
     dataset = saved_config.get('dataset', config.get('dataset', 'cifar10'))
     input_channels = 3 if dataset in ['cifar10', 'cifar100'] else 1
     
-    # Create model
     base_model = get_model(model_name, num_classes, input_channels)
     model = ModelWrapper(base_model, model_name).to(device)
     
@@ -243,9 +431,7 @@ def load_checkpoint_with_partitions(checkpoint_path, device, config):
     
     print(f"✓ Checkpoint loaded successfully")
     print(f"  Model: {model_name}")
-    if partition_info_all:
-        print(f"  - Loaded partition info for {len(partition_info_all)} clients")
-        
+    
     return model, saved_config, partition_info_all
 
 
@@ -417,54 +603,21 @@ def add_backdoor_trigger(data, config):
     
     backdoored = data.clone()
     
-    if backdoored.dim() == 4:  # [B, C, H, W]
+    if backdoored.dim() == 4:
         B, C, H, W = backdoored.shape
         backdoored[:, :, H-trigger_size:H, W-trigger_size:W] = trigger_value
-    elif backdoored.dim() == 3:  # [C, H, W]
+    elif backdoored.dim() == 3:
         C, H, W = backdoored.shape
         backdoored[:, H-trigger_size:H, W-trigger_size:W] = trigger_value
-    elif backdoored.dim() == 2:  # [H, W]
+    elif backdoored.dim() == 2:
         H, W = backdoored.shape
         backdoored[H-trigger_size:H, W-trigger_size:W] = trigger_value
     
     return backdoored
 
 
-def evaluate_model(model, dataloaders, device, config=None):
-    """Evaluate model with comprehensive metrics"""
-    # Unwrap model
-    eval_model = model
-    if isinstance(model, nn.DataParallel):
-        eval_model = model.module
-    if isinstance(eval_model, ModelWrapper):
-        eval_model = eval_model.base_model
-    
-    eval_model.eval()
-    
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for dataloader in dataloaders:
-            test_loader = dataloader.get_test_loader()
-            for data, target in test_loader:
-                data, target = data.to(device), target.to(device)
-                output = eval_model(data)
-                pred = output.argmax(dim=1)
-                correct += pred.eq(target).sum().item()
-                total += target.size(0)
-    
-    overall_acc = correct / total if total > 0 else 0.0
-    
-    return {
-        'overall_acc': overall_acc,
-        'total_samples': total
-    }
-
-
 def evaluate_backdoor_attack(model, dataloaders, device, config):
     """Evaluate Backdoor Attack Success Rate with 3×3 trigger"""
-    # Unwrap model
     eval_model = model
     if isinstance(model, nn.DataParallel):
         eval_model = model.module
@@ -501,53 +654,7 @@ def evaluate_backdoor_attack(model, dataloaders, device, config):
     }
 
 
-def evaluate_confuse_attack(model, dataloaders, device, config):
-    """Evaluate label confusion attack"""
-    # Unwrap model
-    eval_model = model
-    if isinstance(model, nn.DataParallel):
-        eval_model = model.module
-    if isinstance(eval_model, ModelWrapper):
-        eval_model = eval_model.base_model
-    
-    eval_model.eval()
-    
-    map_confuse = config.get('MAP_CONFUSE', {})
-    confusion_stats = defaultdict(lambda: {'correct': 0, 'confused': 0, 'total': 0})
-    
-    with torch.no_grad():
-        for dataloader in dataloaders:
-            test_loader = dataloader.get_test_loader()
-            for data, target in test_loader:
-                data, target = data.to(device), target.to(device)
-                output = eval_model(data)
-                pred = output.argmax(dim=1)
-                
-                for t, p in zip(target, pred):
-                    t_item = t.item()
-                    p_item = p.item()
-                    
-                    if t_item in map_confuse:
-                        target_confused = map_confuse[t_item]
-                        confusion_stats[t_item]['total'] += 1
-                        
-                        if p_item == t_item:
-                            confusion_stats[t_item]['correct'] += 1
-                        elif p_item == target_confused:
-                            confusion_stats[t_item]['confused'] += 1
-    
-    confuse_results = {}
-    for source_class, stats in confusion_stats.items():
-        if stats['total'] > 0:
-            confuse_rate = stats['confused'] / stats['total']
-            correct_rate = stats['correct'] / stats['total']
-            confuse_results[f'class_{source_class}_confuse_rate'] = confuse_rate
-            confuse_results[f'class_{source_class}_correct_rate'] = correct_rate
-    
-    return confuse_results
-
-
-def train_federated(config, dataloaders, device):
+def train_federated(config, dataloaders, device, args):
     """Federated learning training phase"""
     print(f"\nStarting FL training on {device}")
     print(f"Attack type: {config.get('UNLEARNING_CASE', 'NORMAL')}")
@@ -557,7 +664,6 @@ def train_federated(config, dataloaders, device):
         trigger_size = config.get('BACKDOOR_TRIGGER_SIZE', 3)
         print(f"Backdoor trigger: {trigger_size}×{trigger_size} white pixels")
     
-    # Create model
     model_name = config.get('model_name', 'nf_resnet18')
     num_classes = config['num_classes']
     input_channels = 3 if config['dataset'] in ['cifar10', 'cifar100'] else 1
@@ -578,17 +684,14 @@ def train_federated(config, dataloaders, device):
             if train_loader is None:
                 continue
             
-            # Create local model
             local_base_model = get_model(model_name, num_classes, input_channels)
             local_model = ModelWrapper(local_base_model, model_name).to(device)
             
-            # Copy global weights
             if isinstance(model, nn.DataParallel):
                 local_model.base_model.load_state_dict(model.module.base_model.state_dict())
             else:
                 local_model.base_model.load_state_dict(model.base_model.state_dict())
             
-            # Local training
             optimizer = torch.optim.SGD(
                 local_model.parameters(),
                 lr=config['learning_rate'],
@@ -610,7 +713,6 @@ def train_federated(config, dataloaders, device):
             client_weights.append({k: v.cpu().clone() for k, v in local_model.base_model.state_dict().items()})
             client_sizes.append(len(train_loader.dataset))
         
-        # FedAvg aggregation
         total_size = sum(client_sizes)
         aggregated_weights = {}
         for key in client_weights[0].keys():
@@ -619,27 +721,40 @@ def train_federated(config, dataloaders, device):
                 for w, size in zip(client_weights, client_sizes)
             )
         
-        # Update global model
         if isinstance(model, nn.DataParallel):
             model.module.base_model.load_state_dict(aggregated_weights)
         else:
             model.base_model.load_state_dict(aggregated_weights)
         
-        # Evaluation
         if round_idx % config['eval_interval'] == 0:
-            results = evaluate_model(model, dataloaders, device, config)
+            results = evaluate_model_comprehensive(model, dataloaders, device, config)
             print(f"\nRound {round_idx}:")
-            print(f"  Overall Accuracy: {results['overall_acc']:.4f}")
+            print(f"  Test Acc: {results['test_acc']:.4f} | Train Acc: {results['train_acc']:.4f}")
             
             if config.get('UNLEARNING_CASE') == 'BACKDOOR':
                 backdoor_results = evaluate_backdoor_attack(model, dataloaders, device, config)
-                print(f"  Backdoor ASR ({backdoor_results['trigger_size']}): {backdoor_results['backdoor_asr']:.4f}")
-            
-            elif config.get('UNLEARNING_CASE') == 'CONFUSE':
-                confuse_results = evaluate_confuse_attack(model, dataloaders, device, config)
-                print(f"  Confuse Metrics: {list(confuse_results.items())[:2]}")
+                print(f"  Backdoor ASR: {backdoor_results['backdoor_asr']:.4f}")
     
-    # Return unwrapped model
+    # Final comprehensive evaluation
+    print("\n" + "="*60)
+    print("FINAL TRAINING PHASE EVALUATION")
+    print("="*60)
+    
+    final_results = evaluate_model_comprehensive(model, dataloaders, device, config)
+    
+    print(f"Test Accuracy:       {final_results['test_acc']:.4f} ({final_results['test_samples']} samples)")
+    print(f"Train Accuracy:      {final_results['train_acc']:.4f} ({final_results['train_samples']} samples)")
+    print(f"Forget Accuracy:     {final_results['forget_acc']:.4f} ({final_results['forget_samples']} samples)")
+    print(f"Validation Accuracy: {final_results['val_acc']:.4f} ({final_results['val_samples']} samples)")
+    
+    if config.get('UNLEARNING_CASE') == 'BACKDOOR':
+        backdoor_results = evaluate_backdoor_attack(model, dataloaders, device, config)
+        print(f"Backdoor ASR:        {backdoor_results['backdoor_asr']:.4f}")
+        final_results.update(backdoor_results)
+    
+    # Save to CSV
+    save_accuracy_to_csv(final_results, 'training', config, args)
+    
     if isinstance(model, nn.DataParallel):
         return model.module
     return model
@@ -715,7 +830,7 @@ def apply_fgmp(model, trained_model, device):
                 continue
 
 
-def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, device):
+def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, device, args, all_dataloaders):
     """Perform FCU unlearning - MCU + FGMP"""
     mode = config.get('UNLEARNING_MODE', 'DATA_LEVEL')
     
@@ -723,7 +838,6 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
     print(f"FCU UNLEARNING - {mode} MODE")
     print(f"{'='*60}")
     
-    # Count samples
     if mode == "CLIENT_LEVEL":
         total_forget_samples = sum(
             len(dl.get_combined_train_loader().dataset) if dl.get_combined_train_loader() else 0
@@ -743,7 +857,6 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
     print(f"Samples to forget: {total_forget_samples}")
     print(f"Samples to retain: {total_retain_samples}")
     
-    # Create reference model (random init)
     model_name = config.get('model_name', 'nf_resnet18')
     num_classes = config['num_classes']
     input_channels = 3 if config['dataset'] in ['cifar10', 'cifar100'] else 1
@@ -753,14 +866,12 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
     reference_model.eval()
     print("✓ Reference model (random init) for MCU")
     
-    # Store trained model for FGMP
     trained_base_model = get_model(model_name, num_classes, input_channels)
     trained_model = ModelWrapper(trained_base_model, model_name).to(device)
     trained_model.base_model.load_state_dict(model.base_model.state_dict())
     trained_model.eval()
     print("✓ Trained model saved for FGMP")
     
-    # Optimizer
     optimizer = torch.optim.SGD(
         model.parameters(),
         lr=config.get('unlearn_lr', 0.01),
@@ -784,7 +895,6 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
     print(f"\nHyperparameters:")
     print(f"  Epochs: {unlearn_epochs}, LR: {config.get('unlearn_lr', 0.01)}")
     print(f"  Lambda MCU: {lambda_mcu}, Lambda Retain: {lambda_retain}")
-    print(f"  FGMP Frequency: {T_fgmp}, MCU Temp: {T_mcu}")
     
     criterion = nn.CrossEntropyLoss()
     model.train()
@@ -795,7 +905,6 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
         epoch_retain_loss = 0.0
         num_batches = 0
         
-        # Get loaders
         forget_loaders = []
         if mode == "CLIENT_LEVEL":
             for dl in forget_dataloaders:
@@ -822,7 +931,6 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
             optimizer.zero_grad()
             total_loss = 0.0
             
-            # MCU Loss
             mcu_loss = 0.0
             mcu_count = 0
             
@@ -847,7 +955,6 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
                     total_loss += lambda_mcu * mcu_loss
                     epoch_mcu_loss += mcu_loss.item()
             
-            # Retain Loss
             retain_loss = 0.0
             retain_count = 0
             
@@ -888,6 +995,27 @@ def unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, devi
             print(f"Epoch {epoch:3d}: LR={current_lr:.6f}, MCU={avg_mcu:.4f}, Retain={avg_retain:.4f}")
     
     print(f"\n✓ Unlearning completed")
+    
+    # Final comprehensive evaluation
+    print("\n" + "="*60)
+    print("FINAL UNLEARNING PHASE EVALUATION")
+    print("="*60)
+    
+    final_results = evaluate_model_comprehensive(model, all_dataloaders, device, config)
+    
+    print(f"Test Accuracy:       {final_results['test_acc']:.4f} ({final_results['test_samples']} samples)")
+    print(f"Train Accuracy:      {final_results['train_acc']:.4f} ({final_results['train_samples']} samples)")
+    print(f"Forget Accuracy:     {final_results['forget_acc']:.4f} ({final_results['forget_samples']} samples)")
+    print(f"Validation Accuracy: {final_results['val_acc']:.4f} ({final_results['val_samples']} samples)")
+    
+    if config.get('UNLEARNING_CASE') == 'BACKDOOR':
+        backdoor_results = evaluate_backdoor_attack(model, all_dataloaders, device, config)
+        print(f"Backdoor ASR:        {backdoor_results['backdoor_asr']:.4f}")
+        final_results.update(backdoor_results)
+    
+    # Save to CSV
+    save_accuracy_to_csv(final_results, 'unlearning', config, args)
+    
     return model
 
 
@@ -953,7 +1081,6 @@ def main():
     if args.is_unlearn:
         print_unlearning_scenario(config, args.excluded_clients)
     
-    # Create dataloaders
     dataloaders = []
     for client_id in range(config['num_clients']):
         client_forgetting_config = get_client_forgetting_config(
@@ -976,7 +1103,6 @@ def main():
     print_poisoning_summary(dataloaders, config)
     print_client_summary(dataloaders, args.excluded_clients, config)
     
-    # Phase 1: Training or Load
     if args.load_model:
         print("\nLOADING PRE-TRAINED MODEL")
         model, saved_config, partition_info_all = load_checkpoint_with_partitions(
@@ -986,19 +1112,18 @@ def main():
         if args.verify_partitions and partition_info_all:
             verify_partition_consistency(dataloaders, partition_info_all)
         
-        results = evaluate_model(model, dataloaders, device, config)
-        print(f"Loaded Model Accuracy: {results['overall_acc']:.4f}")
+        results = evaluate_model_comprehensive(model, dataloaders, device, config)
+        print(f"Loaded Model Test Accuracy: {results['test_acc']:.4f}")
         
     elif not args.skip_training:
         print("\nFEDERATED TRAINING PHASE")
-        model = train_federated(config, dataloaders, device)
+        model = train_federated(config, dataloaders, device, args)
         
         save_path = Path(config.get('checkpoint_dir', './checkpoints'))
         save_path.mkdir(parents=True, exist_ok=True)
         save_checkpoint(model, None, config['num_rounds'], dataloaders,
                        save_path / 'trained_model.pt', config)
     
-    # Phase 2: Unlearning
     if args.is_unlearn:
         print("\nUNLEARNING PHASE")
         forget_dataloaders, retain_dataloaders = get_unlearning_dataloaders(
@@ -1006,19 +1131,20 @@ def main():
         )
         
         print("\nBefore Unlearning:")
-        results_before = evaluate_model(model, dataloaders, device, config)
-        print(f"  Accuracy: {results_before['overall_acc']:.4f}")
+        results_before = evaluate_model_comprehensive(model, dataloaders, device, config)
+        print(f"  Test Acc: {results_before['test_acc']:.4f} | Train Acc: {results_before['train_acc']:.4f}")
+        print(f"  Forget Acc: {results_before['forget_acc']:.4f} | Val Acc: {results_before['val_acc']:.4f}")
         
         if config.get('UNLEARNING_CASE') == 'BACKDOOR':
             backdoor_before = evaluate_backdoor_attack(model, dataloaders, device, config)
             print(f"  Backdoor ASR: {backdoor_before['backdoor_asr']:.4f}")
         
-        model = unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, device)
+        model = unlearn_with_fcu(model, forget_dataloaders, retain_dataloaders, config, device, args, dataloaders)
         
         print("\nAfter Unlearning:")
-        results_after = evaluate_model(model, dataloaders, device, config)
-        print(f"  Accuracy: {results_after['overall_acc']:.4f}")
-        print(f"  Change: {results_after['overall_acc'] - results_before['overall_acc']:+.4f}")
+        results_after = evaluate_model_comprehensive(model, dataloaders, device, config)
+        print(f"  Test Acc: {results_after['test_acc']:.4f} | Train Acc: {results_after['train_acc']:.4f}")
+        print(f"  Forget Acc: {results_after['forget_acc']:.4f} | Val Acc: {results_after['val_acc']:.4f}")
         
         if config.get('UNLEARNING_CASE') == 'BACKDOOR':
             backdoor_after = evaluate_backdoor_attack(model, dataloaders, device, config)
