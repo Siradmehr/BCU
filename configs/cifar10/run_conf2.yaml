@@ -12,7 +12,7 @@ model: "resnet18"
 # ============================================
 # Federated Learning Training
 # ============================================
-num_rounds: 31
+num_rounds: 2
 local_epochs: 3
 learning_rate: 0.5
 momentum: 0.9
@@ -96,7 +96,7 @@ CLIENT_ID_TO_FORGET: [0]  # Remove these 3 clients COMPLETELY
 
 # Backdoor trigger settings (applied during training phase)
 BACKDOOR_TARGET_LABEL: 0  # All backdoored samples → class 0 (airplane)
-BACKDOOR_TRIGGER_SIZE: 5   # 5x5 pixel white square
+BACKDOOR_TRIGGER_SIZE: 3   # 5x5 pixel white square
 BACKDOOR_TRIGGER_VALUE: 1.0
 
 # ============================================
