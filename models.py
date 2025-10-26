@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 from typing import Type, Any, Callable, Union, List, Optional
-from nfnets import WSConv2d, ScaledStdConv2d
+from nfnets import ScaledStdConv2d
 from functools import partial
 import torch.nn.functional as F
 from .classic_models import get_classic_model
