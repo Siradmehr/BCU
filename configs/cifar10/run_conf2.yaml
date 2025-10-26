@@ -12,7 +12,7 @@ model: "resnet18"
 # ============================================
 # Federated Learning Training
 # ============================================
-num_rounds: 2
+num_rounds: 31
 local_epochs: 3
 learning_rate: 0.5
 momentum: 0.9
